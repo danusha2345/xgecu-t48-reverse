@@ -57,6 +57,7 @@ class TopOp:
     NAND_INIT       = 0x02
     BEGIN_TRANS     = 0x03    # 64-byte init+pin-check packet for eMMC too
     END_TRANS       = 0x04
+    ADAPTER_CMD     = 0x2B    # Adapter command channel (ISP adapter cfg) — §27.2
     READID          = 0x05    # identify; also used by Xgpro eMMC init
     READ_USER       = 0x06    # config zone; also used by Xgpro eMMC init
     READ_CFG        = 0x08    # in eMMC this becomes the long-recv envelope
@@ -431,6 +432,26 @@ class T48Emmc:
         msg[1] = 2                          # sub-cmd: set VCCIO voltage
         msg[8] = vccio_index
         self.ep1_send(bytes(msg))
+
+    # ---- ISP adapter channel (top-op 0x2B, §27.2) ----
+    def adapter_query(self) -> None:
+        """Send the 'query adapter' packet (top-op 0x2B, sub 0xFF)."""
+        self.ep1_send(struct.pack('<BB6x', 0x2B, 0xFF))
+
+    def adapter_configure(self, param_a: int, param_b: int) -> None:
+        """Send the 'configure adapter' packet (top-op 0x2B, sub 0x02).
+        param_a is the 4-byte payload, param_b the 2-byte sub-param.
+        Exact field semantics need confirmation against a USB capture."""
+        self.ep1_send(struct.pack('<BBHI', 0x2B, 0x02, param_b & 0xFFFF, param_a & 0xFFFFFFFF))
+
+    # ---- device identification (§27.3) ----
+    def identify_programmer(self) -> bytes:
+        """First thing Xgpro sends on a fresh handle (FUN_004dba90):
+        8 zero bytes EP1 OUT → 64 bytes EP1 IN.  reply[10] is the T48
+        model code (0x05 / 0x06 / 0x07 are recognised values).
+        Returns the full 64-byte info block."""
+        self.ep1_send(b'\x00' * 8)
+        return self.ep1_recv(0x40)
 
     def reset_pin_drivers(self) -> None:
         """RESET_PIN_DRIVERS (top-op 0x2D) — always call this between

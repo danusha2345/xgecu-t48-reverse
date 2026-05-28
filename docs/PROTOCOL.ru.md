@@ -1347,6 +1347,165 @@ Bitmask значения (`0x0AB8A3FE`, `0x0AB8A1E0`, …) кодируют ка
 lines routed к какому eMMC ball для этой variant. Полезно при
 диагностике «Bad Pin On ISP».
 
+---
+
+## 27. Ветка работы с eMMC-ISP адаптером
+
+### 27.1 Выбор variant — что считается ISP
+
+Чип с variant high byte `'A'` (`0x41`) или `'D'` (`0x44`) — т.е.
+варианты `0x41xx` / `0x44xx` — идёт в **ISP-ветку**. Low byte = voltage:
+
+| variant   | режим            | алгоритм             |
+|-----------|------------------|----------------------|
+| `0x4100`  | ISP 1-bit, 1.8 V | `EMMC_41_18.alg`     |
+| `0x4133`  | ISP 1-bit, 3.3 V | `EMMC_41_33.alg`     |
+| `0x4400`  | ISP 4-bit, 1.8 V | `EMMC_44_18.alg`     |
+| `0x4433`  | ISP 4-bit, 3.3 V | `EMMC_44_33.alg`     |
+
+`FUN_004e18d0` (§26.3) для high byte возвращает **expected pin bitmask**:
+`'A' → 0x0AB8A018`, `'D' → 0x0AB8A0DC`. Это с чем сравнивается actual
+status reply для определения **какой именно пин** отвалился.
+
+### 27.2 Top-opcode `0x2B` — adapter command channel (новый!)
+
+`FUN_004583f0` (около "Adapter not matched, use:") говорит с адаптером
+через **новый top-opcode**, не виденный раньше:
+
+```c
+void adapter_cmd(handle, byte param_a, byte param_b) {
+    uint8_t pkt[8];
+    *(u16*)&pkt[0] = 0xFF2B;             // byte 0 = 0x2B, byte 1 = 0xFF
+    raw_send(handle, pkt, 8);            // 1й пакет: query adapter
+
+    *(u16*)&pkt[0] = 0x022B;             // byte 0 = 0x2B, byte 1 = 0x02
+    *(u16*)&pkt[2] = param_b;
+    *(u32*)&pkt[4] = param_a;
+    raw_send(handle, pkt, 8);            // 2й пакет: configure adapter
+}
+```
+
+Так что **top-op `0x2B` — adapter channel**:
+
+| `pkt[1]` | Назначение (предв.)                          |
+|---------:|----------------------------------------------|
+| `0xFF`   | "query adapter" / start transaction          |
+| `0x02`   | "set adapter params" (с 2- + 4-байт payload) |
+
+Это **отдельно от** secure-element аутентификации между **адаптером ↔
+прошивкой T48**. С ПК мы видим только **конфигурацию** адаптера через
+firmware.
+
+Для нашего ПО:
+- Реверс crypto не нужен.
+- Возможно нужно слать те же `0x2B/0xFF` + `0x2B/0x02` перед первой
+  eMMC-операцией, чтобы прошивка знала какой адаптер используется.
+- Точные `param_a`/`param_b` — снимать с USB-дампа.
+
+### 27.3 Device identification — пустой пакет → 64 байта info
+
+`FUN_004dba90` — **первое что Xgpro шлёт** на свежий handle:
+
+```c
+uint8_t empty_pkt[8] = {0};
+WinUsb_WritePipe(handle, 1, empty_pkt, 8, ...);      // EP1 OUT — все нули
+uint8_t info[64];
+raw_recv(handle, info, 0x40);                         // EP1 IN — 64 байта
+if (info[10] ∈ {0x05, 0x06, 0x07}) {
+    // valid T48 модель
+}
+```
+
+Это **критично для нашего прототипа**: как самую первую транзакцию
+после `connect()` шлём 8 нулевых байт, читаем 64. `reply[10]` = код
+модели (`0x05`/`0x06`/`0x07`); другие поля — firmware version, S/N.
+
+Паттерн "send all-zero команду для banner reply" — стандарт для
+vendor-specific WinUSB, теперь подтверждён для T48.
+
+### 27.4 Полный flow ISP-чтения
+
+`FUN_004a98f0` — entry для **ISP-чтения**. Суть:
+
+```c
+void isp_read(handle, ..., chip_params, ...) {
+    open_temp_file();
+    block_count = DAT_007475a4 >> 14;             // total / 16K
+    update_ui(...);
+
+    if (!FUN_004fc156(param_7, /*flag=*/0x8040, 0))  // partition switch (ISP-mode bit 0x80)
+        bail_out("partition switch failed");
+
+    uint32_t buf[128];
+    uint32_t current_addr = 0;
+    while (block_count-- > 0) {
+        // Format C bulk-write SETUP, req=4 (READ), gen_nonce=1:
+        rc = FUN_00492670(handle, buf, current_addr,
+                          0, 0, /*count=*/1, /*req=*/4,
+                          0, /*gen_nonce=*/1, /*key_src=*/0);
+        if (rc == -1) { error("ReadDevice Error : CMD25"); break; }
+        // Format D bulk-read 64 секторов (32 КБ) на EP2 IN:
+        FUN_00492590(handle, output_buf, /*count=*/0x40);
+        save_to_file(...);
+        current_addr += 0x40;
+    }
+}
+```
+
+Отличия от BGA-сокет ветки (`FUN_0049d910`):
+- ISP **всегда** ставит `gen_nonce=1`. Случайный nonce — часть frame
+  даже без ключа. Скорее всего FPGA/прошивка использует nonce как
+  wiggle-bit для целостности ISP-сигнала.
+- Partition switch обёрнут в `FUN_004fc156(0x8040)`. High byte `0x80` —
+  "ISP path bit", low byte `0x40` совпадает с ISP 4-bit variant high.
+
+### 27.5 Adapter integrity check через CRC32 (`FUN_004ee610`)
+
+`FUN_004ee610` считает CRC32 (table в `DAT_006c3300`) над **четырьмя
+буферами подряд**:
+
+```c
+uint32_t adapter_integrity_crc() {
+    uint32_t crc = 0xFFFFFFFF;
+    crc = crc32_update(crc, DAT_007a3c0c, DAT_007a397c);   // code-memory buffer
+    crc = crc32_update(crc, DAT_007a4034, DAT_007a39ac);   // CID + CSD
+    crc = crc32_update(crc, &DAT_007c8048, DAT_007a39b0);  // RPMB key table 2 (32 B!)
+    crc = crc32_update(crc, &DAT_007a3c10, 0x100);          // 256-байт config
+    return ~crc;
+}
+```
+
+То что **RPMB-ключ часть хэша** сильно намекает: это **host-side
+adapter identity check** — хост должен знать свою копию RPMB-ключа
+чтобы получить value, которое адаптер ожидает.
+
+**Для нашего ПО:** ломать этот CRC **не нужно**. Проверка проходит
+между ПК-софтом и прошивкой T48 через данные включая чип. Наше ПО
+просто шлёт тот же набор `FUN_00492f30 / 00492670 / 00492590` —
+прошивка сама ведёт adapter-side challenge.
+
+### 27.6 ISP-read session end-to-end
+
+```
+1.  connect() → libusb a466:0a53
+2.  identify_programmer()        ; FUN_004dba90 — 8 нулей → 64 байт info
+3.  load_chip_params_from_db()   ; FUN_004edaa0 эквивалент локально
+4.  adapter_cmd(0x2B, 0xFF, …)   ; top-op 0x2B, sub 0xFF — query
+5.  adapter_cmd(0x2B, 0x02, …)   ; top-op 0x2B, sub 0x02 — configure
+6.  begin_transaction(packet64)  ; top-op 0x03 — 64-байт BEGIN_TRANS
+7.  request_status() → OVC check ; top-op 0x39 — reply[12] & 0x01
+8.  init_emmc()                  ; opcodes 0x21 / 0x05 / 0x06
+9.  CMD6 SWITCH HS-200 и т.д.    ; Format A sub-op 0x46
+10. цикл чтения                  ; Format C setup gen_nonce=1 + Format D bulk read
+11. CMD13 polling между bursts   ; Format A sub-op 0x4D
+12. CMD12 STOP в конце           ; Format A sub-op 0x4C
+13. END_TRANSACTION              ; top-op 0x04
+14. close()
+```
+
+ISP-специфика — шаги 4-5 (`0x2B` adapter channel) и `gen_nonce=1` на
+шаге 10. Всё остальное общее с BGA-socket путём.
+
 ### 26.4 Финальные нерешённые опкоды
 
 Без живого железа пока не закроем:

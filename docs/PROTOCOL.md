@@ -1660,6 +1660,203 @@ The bitmasks themselves (32-bit values like `0x0AB8A3FE`, `0x0AB8A1E0`,
 for that variant. Useful for our software when diagnosing "Bad Pin On
 ISP" reports.
 
+---
+
+## 27. The eMMC-ISP adapter code path
+
+### 27.1 Variant selection — which branch is "ISP"
+
+A chip selected from the database with variant high byte `'A'` (`0x41`)
+or `'D'` (`0x44`) — i.e. variants `0x41xx` / `0x44xx` — runs the
+**ISP code path**. Variant low byte still encodes voltage (`0x00` =
+1.8 V, `0x33` = 3.3 V), so the four canonical ISP variants are:
+
+| variant   | mode             | algorithm file       |
+|-----------|------------------|----------------------|
+| `0x4100`  | ISP 1-bit, 1.8 V | `EMMC_41_18.alg`     |
+| `0x4133`  | ISP 1-bit, 3.3 V | `EMMC_41_33.alg`     |
+| `0x4400`  | ISP 4-bit, 1.8 V | `EMMC_44_18.alg`     |
+| `0x4433`  | ISP 4-bit, 3.3 V | `EMMC_44_33.alg`     |
+
+`FUN_004e18d0` (§26.3) keys off the high byte: `'A' → 0x0AB8A018`,
+`'D' → 0x0AB8A0DC` — these are the **expected pin bitmasks** for each
+ISP variant. They are what diagnostic code compares against the actual
+status reply to decide *which pin* failed (vs. just reporting "Bad Pin
+On ISP").
+
+### 27.2 Top-opcode `0x2B` — adapter command channel (new!)
+
+`FUN_004583f0` (the function near the "Adapter not matched, use:" string)
+talks to the adapter over a *new* top-opcode that wasn't in any earlier
+section:
+
+```c
+void adapter_cmd(handle, byte param_a, byte param_b) {
+    uint8_t pkt[8];
+    *(u16*)&pkt[0] = 0xFF2B;             // byte 0 = 0x2B (top-op), byte 1 = 0xFF
+    raw_send(handle, pkt, 8);            // 1st packet: query adapter
+    
+    *(u16*)&pkt[0] = 0x022B;             // byte 0 = 0x2B, byte 1 = 0x02
+    *(u16*)&pkt[2] = param_b;            // bytes 2..4
+    *(u32*)&pkt[4] = param_a;            // bytes 4..8
+    raw_send(handle, pkt, 8);            // 2nd packet: configure adapter
+}
+```
+
+So **top-opcode `0x2B` is the adapter channel**, with at least two
+sub-codes:
+
+| `pkt[1]` | Meaning (provisional)                                     |
+|---------:|-----------------------------------------------------------|
+| `0xFF`   | "query adapter" / start a transaction                     |
+| `0x02`   | "set adapter parameters" (with 2- + 4-byte payload)       |
+
+This is *separate from* the secure-element authentication that the
+**adapter ↔ T48 firmware** runs between themselves — that one we do
+not see from the PC. What we do see is Xgpro sending **adapter
+configuration** down to the T48 firmware, which then forwards / applies
+it to the genuine adapter.
+
+For our own software the practical implication is:
+- We don't need to implement the secure-element challenge/response.
+- We may need to send the same `0x2B/0xFF` + `0x2B/0x02` pair Xgpro does
+  before the first eMMC operation, so the firmware knows which adapter
+  it's working with.
+- Capturing the exact `param_a` / `param_b` from a USB session is the
+  cleanest way to lock down their semantics.
+
+### 27.3 Device identification — empty packet → 64-byte info
+
+`FUN_004dba90` is the **first thing Xgpro sends to a freshly-opened
+handle**:
+
+```c
+void identify_programmer(handle) {
+    uint8_t empty_pkt[8] = {0};
+    WinUsb_WritePipe(handle, /*pipe=*/1, empty_pkt, 8, ...);  // EP1 OUT — all zeros
+    
+    uint8_t info[64];
+    int rc = raw_recv(handle, info, 0x40);                     // EP1 IN — 64 bytes
+    if (rc < 8) {
+        AfxMessageBox("Read device information error!");
+        return;
+    }
+    char device_type = info[10];          // byte 10 of the 64-byte reply
+    if (device_type == 0x05 ||
+        device_type == 0x06 ||
+        device_type == 0x07) {
+        // ok — recognised T48 model
+    }
+}
+```
+
+This is **invaluable for our prototype**: as the very first transaction
+after `connect()`, send eight zero bytes and read back 64. The reply
+byte at offset 10 is a **device-type / model code** (`0x05`, `0x06`,
+`0x07` correspond to the three recognised model variants); other
+fields in the 64-byte block carry firmware version, serial number etc.
+
+The convention "send an all-zero command to get a banner reply" is
+common for vendor-specific WinUSB devices, but we now have it
+confirmed for the T48 specifically.
+
+### 27.4 Full ISP read flow (Ghidra-decoded)
+
+`FUN_004a98f0` is the entry point for an **ISP-mode read** session.
+Stripped to its essentials:
+
+```c
+void isp_read(handle, ..., chip_params, ...) {
+    open_temp_file();
+    block_count = DAT_007475a4 >> 14;             // total / 16 K
+    
+    update_ui(...);
+
+    if (!FUN_004fc156(param_7, /*flag=*/0x8040, 0))
+        bail_out("partition switch failed");
+
+    uint32_t buf[128];                            // 512-byte aligned
+    uint32_t current_addr = 0;
+    while (block_count-- > 0) {
+        // Format C bulk-write SETUP — but with req=4 (READ),
+        // generate_nonce=1, no key:
+        rc = FUN_00492670(handle, buf, current_addr,
+                          /*p4=*/0, /*p5=*/0, /*count=*/1,
+                          /*req=*/4, /*p8=*/0,
+                          /*gen_nonce=*/1, /*key_src=*/0);
+        if (rc == -1) { error("ReadDevice Error : CMD25"); break; }
+
+        // Format D bulk-read — read 64 sectors (32 KB) on EP2 IN:
+        FUN_00492590(handle, output_buf, /*count=*/0x40);
+
+        save_to_file(...);
+        current_addr += 0x40;
+    }
+}
+```
+
+Notable points compared to the BGA-socket path (`FUN_0049d910`):
+- The ISP path **always** sets `gen_nonce=1` in the Format C setup. The
+  random nonce is part of the frame even when no key is embedded.
+  Likely the FPGA / firmware uses the nonce as a wiggle-bit reference
+  for ISP signalling integrity.
+- The partition switch is wrapped in `FUN_004fc156` with a 16-bit flag
+  `0x8040`. The high byte `0x80` looks like a "use ISP path" gate; the
+  low byte `0x40` matches our existing variant high byte for ISP 4-bit
+  (and likely a sub-mask for the partition selector).
+
+### 27.5 Adapter-side integrity check via CRC32 (`FUN_004ee610`)
+
+`FUN_004ee610` returns a single 32-bit value computed as the CRC32
+(polynomial table at `DAT_006c3300`) over **four buffers in sequence**:
+
+```c
+uint32_t adapter_integrity_crc() {
+    uint32_t crc = 0xFFFFFFFF;
+    crc = crc32_update(crc, DAT_007a3c0c, DAT_007a397c);   // code-memory buffer
+    crc = crc32_update(crc, DAT_007a4034, DAT_007a39ac);   // CID + CSD bytes
+    crc = crc32_update(crc, &DAT_007c8048, DAT_007a39b0);  // RPMB key table 2 (32 B)
+    crc = crc32_update(crc, &DAT_007a3c10, 0x100);          // 256-byte config block
+    return ~crc;
+}
+```
+
+The fact that **the RPMB key table is part of the hash** strongly
+suggests this CRC is the host-side end of an adapter-identity check —
+the host needs to know its own copy of the RPMB key in order to produce
+a value the adapter expects. Without the right key, the CRC differs
+and the firmware can refuse to proceed.
+
+**Important for our software:** we *don't* need to break this CRC.
+The check happens between PC software (Xgpro) and the T48 firmware,
+using a value that includes the chip's own data. Our software just
+needs to make the same sequence of calls — `FUN_00492f30 / 00492670 /
+00492590` etc. — and the firmware drives the adapter-side challenge on
+its own.
+
+### 27.6 What an ISP-read session looks like end-to-end
+
+```
+1.  connect() → open libusb a466:0a53
+2.  identify_programmer()        ; FUN_004dba90 — 8 zeros → 64-byte info
+3.  load_chip_params_from_db()   ; FUN_004edaa0 equivalent (locally in our code)
+4.  adapter_cmd(0x2B, 0xFF, …)   ; top-op 0x2B, sub 0xFF — query
+5.  adapter_cmd(0x2B, 0x02, …)   ; top-op 0x2B, sub 0x02 — configure
+6.  begin_transaction(packet64)  ; top-op 0x03 — 64-byte BEGIN_TRANS
+7.  request_status() → check OVC ; top-op 0x39 — reply[12] & 0x01
+8.  init_emmc()                  ; opcodes 0x21 / 0x05 / 0x06 in sequence
+9.  CMD6 SWITCH HS-200 etc.      ; Format A sub-op 0x46
+10. read loop                    ; Format C setup with gen_nonce=1 + Format D bulk read
+11. CMD13 polling between bursts ; Format A sub-op 0x4D
+12. CMD12 STOP at end             ; Format A sub-op 0x4C
+13. END_TRANSACTION              ; top-op 0x04
+14. close()
+```
+
+The ISP-specific steps are 4–5 (`0x2B` adapter channel) and the
+`gen_nonce=1` flag inside step 10. Everything else is shared with the
+BGA-socket path.
+
 ### 26.4 Final unknown opcodes left
 
 Still TBD without further effort:
