@@ -1871,3 +1871,101 @@ Still TBD without further effort:
 
 These remaining items are best resolved against a USB capture from
 the real hardware once it arrives.
+
+---
+
+## 28. Corrections — what static reverse got wrong
+
+This file is a working document; some earlier conclusions were too
+confident given the evidence. The last pass over the still-uncertain
+functions before hardware arrival corrected three meaningful errors.
+
+### 28.1 Top-opcode `0x2B` is **not** the eMMC-ISP adapter channel
+
+§27.2 earlier claimed `0x2B` was an "adapter command channel" used to
+configure the ISP adapter. The unique caller of `FUN_004583f0`
+(`FUN_004576a0`) prints **"Set Uart Ports error!"** and **"Starting
+uart Printer error!"** in its error paths, and immediately drops into
+a UART loop after the `0x2B` pair. So:
+
+| Old claim | New reality |
+|---|---|
+| Top-op `0x2B` is the eMMC-ISP adapter command channel | Top-op `0x2B` is the **UART / Serial-Printer command channel** (the "TV Tools → Serial Printing" UI feature) |
+| Send `0x2B 0xFF` + `0x2B 0x02` before BEGIN_TRANSACTION | **Do not send `0x2B` at all** for eMMC ISP — it has nothing to do with the eMMC code path |
+| Required for adapter recognition | Adapter recognition is **entirely** between the adapter's secure element and the T48 firmware; the PC does not participate |
+
+The practical consequence is actually a **simplification** — our
+prototype's `connect → begin_transaction → init_emmc → …` flow is
+correct as-is, with **no `0x2B` step needed**.
+
+### 28.2 `FUN_004fc156` is `CreateFileA`, not "partition switch"
+
+§27.4 earlier read the call `FUN_004fc156(param_7, 0x8040, 0)` inside
+the ISP read function as "partition switch". The body of
+`FUN_004fc156` is actually a textbook `CreateFileA` wrapper:
+
+```c
+// param_3 & 0x3 → dwDesiredAccess  (0x80000000 GENERIC_READ etc.)
+// param_3 & 0x70 → dwShareMode
+// param_3 & 0xF00 → dwCreationDisposition
+// param_4 → lpSecurityAttributes
+// hands off to CreateFileA / CreateFileW
+```
+
+In context (`FUN_004a98f0` ISP read), the `0x8040` flag is the **file
+mode** for the **output dump file** that captured eMMC sectors are
+written to. So this call **opens a file on the host PC**, it does not
+talk to the eMMC. The partition switch (CMD6 SWITCH PARTITION_CONFIG)
+is sent **earlier**, via the normal `cmd_A(SWITCH, …)` we already
+documented (§19.3 / §20.2).
+
+### 28.3 Sub-op `0x5C` is an 8-counter accumulator — likely a bus test
+
+The only caller of sub-op `0x5C` is `FUN_004b0ca0`, whose body
+accumulates eight per-position byte sums over a buffer in 4-iteration
+loops:
+
+```c
+int counters[8] = {0};
+for (int i = 0; i < 4; i++) {
+    counters[0] += data[0];
+    counters[1] += data[1];
+    counters[2] += data[2];
+    counters[3] += data[3];
+    counters[4] += data[4];
+    counters[5] += data[5];
+    counters[6] += data[6];
+    counters[7] += data[7];
+    data += 8;
+}
+// then calls cmd_A(handle, 0x5C, …) carrying the eight counters
+```
+
+Eight per-bit-lane sums is the canonical pattern for **bus integrity
+testing** — each counter tracks bit-flips on one lane of the 8-bit
+data bus (or 4 lanes × 2 cycles). The most likely role of sub-op
+`0x5C` is "tell FPGA to start / report a bus-test pattern". Its
+single call site is reachable only from a diagnostic dialog that
+doesn't run in the normal read/write path, so we can safely leave it
+unimplemented in the first prototype.
+
+### 28.4 What remains genuinely TBD (capture-only)
+
+After 28.1–28.3 the list of "uncertain" items is short:
+
+- **Exact bit positions inside the 32-byte REQUEST_STATUS reply** —
+  `FUN_004dc6d0` (classic pin decoder) walks a per-variant pin table
+  at `DAT_006B57FC` / `DAT_006B6EE0` and ORs flags into the output
+  block via bit constants `0x8`, `0x20`, `0x2A`, `0x380`, `0x228000`.
+  Mapping these back to physical T48 pin numbers needs **one
+  good-vs-bad-pin USB capture** to nail down.
+- **Voltage encoding bytes inside the 64-byte BEGIN_TRANSACTION**
+  (offsets `0x14..0x18`) — Xgpro pulls them from chip-DB globals but
+  the *exact* byte order vs DAC index in the voltage tables we
+  documented in §21.1 is one capture away from being closed.
+- **`adapter_query` / `adapter_configure`** — removed from the
+  prototype as a result of §28.1; nothing to validate.
+
+These are honestly the only three things the prototype needs the
+first USB capture to settle. Everything else is byte-for-byte
+documented from the binary.

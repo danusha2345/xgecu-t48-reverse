@@ -1517,6 +1517,91 @@ ISP-специфика — шаги 4-5 (`0x2B` adapter channel) и `gen_nonce=1
 
 Эти задачи решатся когда приедет железо и снимем USB-дамп.
 
+---
+
+## 28. Поправки — что статический реверс наврал
+
+Это рабочий документ. Финальный проход по «неуверенным» функциям
+перед приездом железа исправил три значимые ошибки в §27.
+
+### 28.1 Top-opcode `0x2B` — это **НЕ** eMMC-ISP adapter channel
+
+§27.2 ранее утверждал, что `0x2B` — «adapter command channel» для
+ISP-адаптера. Единственный caller `FUN_004583f0` это `FUN_004576a0`,
+который в error-путях печатает **«Set Uart Ports error!»** и
+**«Starting uart Printer error!»**. Так что:
+
+| Было | Правда |
+|---|---|
+| `0x2B` = eMMC-ISP adapter command channel | `0x2B` = **UART / Serial-Printer channel** (фича UI "TV Tools → Serial Printing") |
+| Слать `0x2B 0xFF` + `0x2B 0x02` перед BEGIN_TRANSACTION | **НЕ слать `0x2B` вообще** для eMMC ISP |
+| Нужно для распознавания адаптера | Распознавание адаптера **целиком** между secure-element и прошивкой T48; ПК не участвует |
+
+Это **упрощает** прототип — наш `connect → begin_transaction →
+init_emmc → …` правилен как есть, **без шага `0x2B`**.
+
+### 28.2 `FUN_004fc156` — это `CreateFileA`, не "partition switch"
+
+§27.4 ранее интерпретировал `FUN_004fc156(param_7, 0x8040, 0)` в ISP
+read функции как «partition switch». На самом деле это **textbook
+CreateFileA wrapper**:
+
+```c
+// param_3 & 0x3   → dwDesiredAccess  (0x80000000 GENERIC_READ и т.д.)
+// param_3 & 0x70  → dwShareMode
+// param_3 & 0xF00 → dwCreationDisposition
+// → CreateFileA / CreateFileW
+```
+
+В контексте (`FUN_004a98f0` ISP read) флаг `0x8040` — это **file mode**
+для **выходного dump-файла** на хосте, куда сохраняются прочитанные
+сектора. Это **открытие файла на ПК**, не команда eMMC. Реальный
+partition switch (CMD6 PARTITION_CONFIG) шлётся **раньше**, обычным
+`cmd_A(SWITCH, …)` (§19.3 / §20.2).
+
+### 28.3 Sub-op `0x5C` — это 8-counter accumulator (bus test?)
+
+Единственный caller sub-op `0x5C` — `FUN_004b0ca0`, тело которого
+накапливает восемь per-byte-position сумм по буферу в цикле:
+
+```c
+int counters[8] = {0};
+for (int i = 0; i < 4; i++) {
+    counters[0] += data[0];   counters[4] += data[4];
+    counters[1] += data[1];   counters[5] += data[5];
+    counters[2] += data[2];   counters[6] += data[6];
+    counters[3] += data[3];   counters[7] += data[7];
+    data += 8;
+}
+// → cmd_A(handle, 0x5C, …) с восемью counter'ами
+```
+
+Восемь сумм по битовым позициям — каноничный паттерн **bus integrity
+test**: каждый counter отслеживает bit-flips на одной линии 8-бит data
+шины. Наиболее вероятно, sub-op `0x5C` = «начать / отчитать bus-test
+паттерн» в FPGA. Единственный call site достижим только из
+диагностического диалога, в normal read/write пути не вызывается —
+**первому прототипу можно не реализовывать**.
+
+### 28.4 Что **реально** TBD (нужен дамп)
+
+После 28.1–28.3 список «неуверенного» — короткий:
+
+- **Точные bit-позиции в 32-байтном REQUEST_STATUS reply** —
+  `FUN_004dc6d0` (classic pin decoder) ходит по per-variant таблицам
+  `DAT_006B57FC` / `DAT_006B6EE0` и OR'ит флаги в output через
+  bit-константы `0x8`, `0x20`, `0x2A`, `0x380`, `0x228000`. Маппинг
+  обратно на физические T48 pin номера = **один good-vs-bad-pin USB
+  дамп**.
+- **Voltage encoding в 64-байтном BEGIN_TRANSACTION** (offset
+  `0x14..0x18`) — Xgpro берёт из chip-DB глобалов, но точный
+  byte-order vs DAC-индекс таблиц §21.1 закроется одним дампом.
+- **`adapter_query` / `adapter_configure`** — удалены из прототипа по
+  §28.1; валидировать нечего.
+
+Только эти три вещи реально нужно проверить дампом. Остальное —
+byte-for-byte задокументировано из бинаря.
+
 ### 24.1 Two-step «Program Key»
 
 ```
