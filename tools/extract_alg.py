@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-extract_alg.py — распаковщик алгоритмических файлов XGecu Xgpro (`*.alg`).
+extract_alg.py — unpacker for XGecu Xgpro `*.alg` algorithm files.
 
-Каждый `.alg` содержит сжатый FPGA-битстрим для конкретного семейства
-чипов в программаторе T48 / T56 / T76. Этот скрипт распаковывает .alg в
-сырой 340604-байтный битстрим (Xilinx Spartan-6 LX9 class).
+Each `.alg` ships one compressed FPGA bitstream for one chip family in
+the T48 / T56 / T76 programmer. This script decompresses it to the
+raw 340604-byte payload (Xilinx Spartan-6 LX9 class).
 
-Формат файла (раскрыт реверс-инжинирингом, см. docs/PROTOCOL.md):
+File format (reverse-engineered, see docs/PROTOCOL.md):
 
-    0x000       char[N]    Имя семейства алгоритма, ASCII, \0-terminated
-                            (например: "EMMC211210", "EMMC18", "SPI-18", "AT45DB")
-    0x000..0x220 zero-pad   Заголовок, дополненный нулями
-    0x220       u32 LE      Размер распакованного битстрима = 340604 (0x5327C)
-    0x224       u32 LE      CRC32 сжатых данных = zlib.crc32(comp) ^ 0xFFFFFFFF
-    0x228       …           Сжатый битстрим — zero-RLE по 16-битным словам:
-                              read u16 val;
-                              if val != 0: emit val
-                              else:       read u16 len; emit `len` zero-words
+    0x000        char[N]   algorithm-family name, ASCII, \\0-terminated
+                           (e.g. "EMMC211210", "EMMC18", "SPI-18", "AT45DB")
+    0x000..0x220 zero-pad  header padded with zeros
+    0x220        u32 LE    decompressed bitstream size = 340604 (0x5327C)
+    0x224        u32 LE    CRC32 of compressed data = zlib.crc32(comp) ^ 0xFFFFFFFF
+    0x228        …         compressed bitstream — zero-RLE over 16-bit words:
+                             read u16 val;
+                             if val != 0: emit val
+                             else:       read u16 len; emit `len` zero-words
 
-Распакованные данные начинаются 16-байтным 0xFF preamble + sync-словом
-Xilinx `AA 99 55 66` — каноничный начало битстрима Spartan-6.
+The decompressed payload starts with a 16-byte 0xFF preamble followed
+by the Xilinx Spartan-6 sync word `AA 99 55 66`.
 
 Usage:
-    python3 extract_alg.py path/to/EMMC_53_18.alg                     # -> EMMC_53_18.bit
+    python3 extract_alg.py path/to/EMMC_53_18.alg                    # -> EMMC_53_18.bit
     python3 extract_alg.py file.alg --output decoded.bin --verbose
-    python3 extract_alg.py *.alg                                       # batch
+    python3 extract_alg.py *.alg                                      # batch mode
 """
 import argparse
 import os
@@ -36,18 +36,18 @@ import zlib
 SIZE_OFFSET = 0x220
 CRC_OFFSET  = 0x224
 DATA_OFFSET = 0x228
-EXPECTED_DECOMPRESSED_SIZE = 0x5327C    # 340604 байт; Spartan-6 LX9 bitstream
+EXPECTED_DECOMPRESSED_SIZE = 0x5327C    # 340604 bytes; Spartan-6 LX9-class bitstream
 
 
 def extract(path: str, verify: bool = True) -> tuple[str, bytes]:
-    """Распаковать `.alg` файл и вернуть (algorithm_name, raw_bitstream)."""
+    """Decompress a `.alg` file and return (algorithm_name, raw_bitstream)."""
     with open(path, 'rb') as f:
         d = f.read()
 
     if len(d) < DATA_OFFSET + 4:
         raise ValueError(f"file too short: {len(d)} bytes < {DATA_OFFSET + 4}")
 
-    # Имя алгоритма — null-terminated ASCII в начале
+    # Algorithm name is the null-terminated ASCII string at the start.
     zero = d.index(0)
     name = d[:zero].decode('latin1', errors='replace')
 
@@ -62,7 +62,7 @@ def extract(path: str, verify: bool = True) -> tuple[str, bytes]:
                 f"CRC mismatch: file says 0x{crc:08x}, "
                 f"calculated 0x{calculated_crc:08x}")
 
-    # Распаковка zero-RLE по 16-битным словам
+    # Zero-RLE decompression over 16-bit words.
     out = bytearray()
     n = len(comp) & ~1
     i = 0
@@ -117,7 +117,7 @@ def main() -> int:
             f.write(raw)
 
         if args.verbose:
-            # Поищем sync-слово в стандартной и обратной форме
+            # Look for the sync word in both canonical and byte-rotated forms.
             sync_std = raw.find(b'\xaa\x99\x55\x66')
             sync_alt = raw.find(b'\x99\x55\x66\xaa')
             preamble = "FF×16 OK" if raw[:16] == b'\xff'*16 else "no FF preamble"

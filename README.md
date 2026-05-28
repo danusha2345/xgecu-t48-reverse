@@ -1,5 +1,7 @@
 [![Boosty](https://img.shields.io/badge/Boosty-Buy_me_a_coffee-FF7143?logo=boosty&logoColor=white&style=for-the-badge)](https://boosty.to/danusha/donate)
 
+> 🇷🇺 На русском: [README.ru.md](README.ru.md)
+
 # xgecu-t48-reverse
 
 Reverse-engineered USB protocol notes and a Python prototype for talking

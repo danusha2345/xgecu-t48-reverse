@@ -1,43 +1,61 @@
-# XGecu T48 — заметки по реверсу протокола (для своего ПО под eMMC)
+# XGecu T48 — protocol reverse-engineering notes (eMMC focus)
 
-**Цель:** написать своё ПО на Linux для чтения/записи eMMC через программатор XGecu T48 в режиме ISP. Этот документ собирает результаты реверса.
+> 🇷🇺 На русском: [PROTOCOL.ru.md](PROTOCOL.ru.md)
 
-**Источники истины:**
-- `xgecu/Xgpro.exe` — официальный софт (PE32, 32-бит x86, WinUSB).
-- `xgecu/algorithm/*.alg` — FPGA-битстримы + параметры алгоритмов.
-- `xgecu/InfoIC2Plus.dll` — БД чипов (выгружена в `emmc_chips_t48.json`).
-- minipro 0.7.4 (GPL): `/path/to/minipro/`, `src/t48.c` — открытая реверс-реализация транспорта T48.
+**Goal:** write a Linux-native program for reading/writing eMMC through
+the XGecu T48 universal programmer in ISP (in-circuit) mode. This
+document collects everything we recovered by static analysis of the
+first-party software.
+
+**Sources of truth:**
+
+- `xgecu/Xgpro.exe` — first-party software (PE32, 32-bit x86, WinUSB).
+- `xgecu/algorithm/*.alg` — FPGA bitstreams + algorithm parameters per
+  chip family.
+- `xgecu/InfoIC2Plus.dll` — chip database (dumped via the `dumpic`
+  tool in [`minipro`](https://gitlab.com/DavidGriffith/minipro)).
+- `minipro` 0.7.4 (GPL-3.0), file `src/t48.c` — the open-source
+  reverse-engineered implementation of the T48 transport for
+  classic-chip operations.
+
+None of the proprietary files above are shipped in this repository.
+The interested reader is expected to have a legitimate copy of `Xgpro`.
 
 ---
 
-## 1. USB-идентификация устройства
+## 1. USB identity
 
-Из `xgecu/drv/Xgprowinusb.inf`:
+From the bundled `xgecu/drv/Xgprowinusb.inf`:
+
 - **VID/PID:** `0xA466 / 0x0A53`
-- Класс: WinUSB (vendor-specific bulk)
+- Class: WinUSB (vendor-specific bulk)
 - DeviceInterfaceGUID: `{E7E8BA13-2A81-446E-A11E-72398FBDA82F}`
-- Производитель: «Haikou Xingong Electronic Co,Ltd»
+- Manufacturer: "Haikou Xingong Electronic Co,Ltd"
 
-Linux: открывается напрямую через libusb (`pyusb`/`libusb-1.0`).
+On Linux the device is opened directly through libusb
+(`pyusb` / `libusb-1.0`); no kernel driver is required.
 
-## 2. Endpoint-схема
+## 2. Endpoint map
 
-Из анализа `Xgpro.exe` (вызовы `WinUsb_WritePipe` / `WinUsb_ReadPipe`):
+From analysis of `Xgpro.exe` (call sites of `WinUsb_WritePipe` /
+`WinUsb_ReadPipe`):
 
-| EP | Что идёт | Размер пакета |
-|----|---|---|
-| **EP1** | Команды/конфиг/статус | 8 или 16 байт (фиксированные структуры) |
-| **EP2** | Bulk-данные eMMC | `N × 512` байт (sector-aligned) |
+| EP   | Direction | Carries                       | Packet size                          |
+|------|-----------|-------------------------------|--------------------------------------|
+| EP1  | OUT / IN  | commands, config, status      | 8 or 16 bytes (fixed structures)     |
+| EP2  | OUT       | bulk eMMC data (write side)   | `N × 512` bytes (sector-aligned)     |
+| EP2  | IN        | not observed in Xgpro's flows |                                      |
 
-Статистика call-сайтов: `WinUsb_WritePipe` = 36, `WinUsb_ReadPipe` = 70, `WinUsb_Initialize` = 1.
+Call-site counts in the binary: `WinUsb_WritePipe` = 36 distinct call
+sites, `WinUsb_ReadPipe` = 70, `WinUsb_Initialize` = 1.
 
-## 3. Транспорт классических чипов (открыт minipro)
+## 3. Classic-chip transport (already covered by `minipro`)
 
-Источник — `minipro/src/t48.c`. Опкоды 0x02–0x3F:
+From `minipro/src/t48.c`. Opcodes `0x02..0x3F`:
 
 ```c
 #define T48_NAND_INIT            0x02
-#define T48_BEGIN_TRANS          0x03   // 64-байтный init-пакет: protocol_id, voltages, clock, sizes
+#define T48_BEGIN_TRANS          0x03   // 64-byte init packet: protocol_id, voltages, clock, sizes
 #define T48_END_TRANS            0x04
 #define T48_READID               0x05
 #define T48_READ_USER            0x06
@@ -80,401 +98,414 @@ Linux: открывается напрямую через libusb (`pyusb`/`libus
 #define T48_RESET                0x3F
 ```
 
-## 4. eMMC-часть протокола (опкоды 0x40+, не реверсирована minipro)
+## 4. Protocol architecture: top-opcode + sub-opcode
 
-**Главная функция-обёртка `0x492f30` в Xgpro.exe.** Зовётся 101 раз. Сигнатура (по дизасму):
-```c
-int sub_492f30(handle ebx, byte opcode, dword arg3, ? esi);
-```
-
-Внутри строит пакет на стеке начиная с magic-байта `0x27`, опкода и параметров. Первые 8 байт пакета:
-```
-offset 0: 0x27       // magic (постоянный)
-offset 1: opcode     // байт из arg2
-offset 2: 0x0000     // u16, обнуляется
-offset 4: arg3       // dword (LE)
-```
-
-(Полный размер пакета и роль 4-го аргумента ещё уточняются — см. ниже.)
-
-### Найденные eMMC-опкоды (частотный анализ 101 вызова)
-
-| Opcode | dec | Вызовов | Гипотеза |
-|---|---|---|---|
-| **0x46** | 70 | 59 | Базовая операция eMMC (CMDx + параметры) |
-| 0x50 | 80 | 15 | (TBD — часто; возможно, чтение статуса/конфигурации) |
-| 0x57 | 87 | 4 | (TBD) |
-| 0x4D | 77 | 4 | (TBD) |
-| 0x4C | 76 | 1 | (TBD — редкая инициализация?) |
-| 0x5D | 93 | 1 | (TBD) |
-| 0x5C | 92 | 1 | (TBD) |
-
-Опкоды находятся ВЫШЕ зоны 0x02-0x3F, обработанной minipro → это и есть «дельта» под eMMC.
-
-### Семантические точки в коде (xref'ы строк ошибок)
-
-| JEDEC CMD | Назначение | Строка-маркер | VA xref |
-|---|---|---|---|
-| CMD0/1/2/3 | EMMC init | `EMMC Init ERROR` | 0x4afad5 |
-| CMD12 | STOP_TRANSMISSION | ` -- CMD12` | 0x4ad042 |
-| CMD13 | SEND_STATUS | `Device write error :CMD13` | 0x4acfce, 0x4ad4d8 |
-| CMD18 | READ_MULTIPLE_BLOCK | `ReadDevice Error : CMD18` | 0x49dc96, 0x4a9e57 |
-| CMD25 | WRITE_MULTIPLE_BLOCK | `ReadDevice Error : CMD25` | 0x49dcbd, 0x4a9e5e |
-| watchdog | bulk-read timeout | `EMMC stops responding` | 0x4a8b0b |
-
-Из каждой точки можно проследить ближайший `call 0x492f30` и извлечь использованный опкод+параметры → построить таблицу «JEDEC CMD → T48 USB-пакет».
-
-## 5. Формат файла `.alg` (битстрим FPGA)
-
-Полностью разобран и верифицирован (см. сессию 2026-05-27). Кратко:
+The first byte of every EP1 command packet is the **top-opcode**. For
+some top-opcodes the second byte is a **sub-opcode** that selects a
+specific operation within that class.
 
 ```
-0x000  : имя семейства, ASCII \0-terminated
-0x000..0x220 : zero-padded заголовок (у некоторых семейств в нём sparse-параметры)
-0x220  : u32 LE = размер распакованного битстрима = 340604 (КОНСТАНТА → Xilinx Spartan-6 ~LX9)
-0x224  : u32 LE = CRC32 сжатых данных = (zlib.crc32(comp) XOR 0xFFFFFFFF)
-0x228  : сжатые данные — zero-RLE по u16:
-            val=u16; если val≠0 → пишем val;
-                     если val=0 → len=u16, пишем len нулевых слов.
+EP1 command packet = [byte 0: top-opcode] [byte 1..7: sub-opcode/args]
 ```
 
-Распакованные данные содержат стандартное начало Xilinx-битстрима: 16×0xFF преамбула + sync `AA 99 55 66`.
+### Top-opcodes — unified T48 table
 
-### Связь `variant` ↔ файл `.alg` (через старший байт variant)
+| Top-opcode | Origin           | Purpose                                          | byte[1..7]                                       |
+|------------|------------------|--------------------------------------------------|--------------------------------------------------|
+| `0x02`     | minipro (classic)| `NAND_INIT`                                      | —                                                |
+| `0x03`     | minipro (classic)| **`BEGIN_TRANSACTION`** (protocol_id, voltages, clock, sizes) | 64-byte packet                  |
+| `0x04`     | minipro          | `END_TRANSACTION`                                | —                                                |
+| `0x05`     | minipro + Xgpro  | `READID` — identify chip (used in eMMC init too) | 2-byte param, recv 32 bytes                      |
+| `0x06`     | minipro + Xgpro  | `READ_USER` — config zone (recv 24 in eMMC init) | recv 24 bytes                                    |
+| `0x07..0x1F` | minipro        | classic-chip operations                          | —                                                |
+| `0x08`     | Xgpro NEW (eMMC) | **"long-recv" envelope**                         | sub-opcode (`0x48` = read 512 B) + length + addr |
+| `0x14`     | Xgpro NEW (eMMC) | **bulk-write setup** before EP2 OUT              | sub-opcode + count + block_addr                  |
+| `0x21`     | Xgpro NEW (eMMC) | init / algorithm select for eMMC                 | 1-byte parameter from settings                   |
+| `0x27`     | Xgpro NEW (eMMC) | **eMMC sub-command dispatcher**                  | sub-opcode + 32-bit argument (see below)         |
+| `0x39`     | minipro          | `REQUEST_STATUS`                                 | —                                                |
+| `0x3F`     | minipro          | `RESET`                                          | —                                                |
 
-| variant | name pattern | `.alg` файл | Применение |
-|---|---|---|---|
-| 0x53xx | `_8Bit @BGA153` | EMMC_53_{18,33}.alg | BGA сокет 8-bit |
-| 0x54xx | `_4Bit @BGA153` | EMMC_54_{18,33}.alg | BGA сокет 4-bit |
-| 0x51xx | `_1Bit @BGA153` | EMMC_51_{18,33}.alg | BGA сокет 1-bit |
-| **0x44xx** | `(ISP) _4Bit` | **EMMC_44_{18,33}.alg** | **ISP 4-bit (наш кейс)** |
-| **0x41xx** | `(ISP) _1Bit` | **EMMC_41_{18,33}.alg** | **ISP 1-bit (наш базовый)** |
+### Sub-opcodes under top-opcode `0x27` (eMMC subcommands)
 
-Суффикс `_18`/`_33` = `VCCQ` 1.8В / 3.3В.
+| Sub-op | Semantics                                          | arg32                                                     |
+|--------|----------------------------------------------------|-----------------------------------------------------------|
+| `0x46` | **CMD6 SWITCH**                                    | BE-encoded JEDEC: `[Access][Index][Value][CmdSet]`        |
+| `0x4C` | **CMD12 STOP + CMD13 STATUS**                      | `0`                                                       |
+| `0x4D` | commit / finalize FPGA (password / RPMB write)     | —                                                         |
+| `0x50` | 512-byte data transfer (CMD24 / OTP / RPMB write)  | `0x200`                                                   |
+| `0x57` | **CMD23 SET_BLOCK_COUNT**                          | block count (usually `1`)                                 |
+| `0x5C` | TBD (1 call site)                                  | —                                                         |
+| `0x5D` | Read WGP table (Write-Group Protection)            | —                                                         |
 
-## 6. БД чипов
+### Sub-opcode under top-opcode `0x08`
 
-Выгружена через `dumpic/dump-infoic2plus-dll.exe` (wine):
-- 173 производителя, 34 352 чипа всего
-- **4 796 eMMC** (тип 7), все с `protocol_id = 0x31`
-- Полный отфильтрованный список eMMC: `emmc_chips_t48.json` (2.4 МБ)
+| Sub-op | Semantics                                                    |
+|--------|--------------------------------------------------------------|
+| `0x48` | **CMD8 SEND_EXT_CSD** / CMD17 READ_SINGLE_BLOCK (recv 512 B) |
 
-## 7. Точная структура пакета EP1 (8 байт)
+The 7 sub-opcodes under `0x27` cluster above `0x40` — they are exactly
+the part of the device protocol that `minipro` does *not* implement,
+and they handle every eMMC operation that involves talking to the chip
+controller (versus the FPGA itself).
 
-Подтверждено по дизасму `0x492f30`:
+## 5. eMMC init sequence
+
+Reverse of function `0x4af370` in `Xgpro.exe` (the eMMC init sub-step
+called after `BEGIN_TRANSACTION` from the caller):
+
+```
+Step 1: top-opcode 0x21 + 1-byte parameter [from 0x7485d0]    → recv 8 bytes
+        (probably "select algorithm/variant" for eMMC)
+
+Step 2: top-opcode 0x05 (READID) + 2-byte parameter [0x7a39cc] → recv 32 bytes
+        (chip ID / OCR / CID)
+
+Step 3: top-opcode 0x06 (READ_USER)                            → recv 24 bytes
+        (config or CSD)
+
+Step 4: top-opcode 0x27, sub 0x46 (CMD6 SetBits HS_TIMING=0x01)   → switch to HS-200
+Step 5: top-opcode 0x27, sub 0x46 (CMD6 …)                        → another ECSD setup
+```
+
+The `BEGIN_TRANSACTION` (opcode `0x03`) with `protocol_id = 0x31`
+(`IC2_ALG_EMMC`) and the right `variant` (e.g. `0x4100` for ISP 1-bit)
+is sent *before* `0x4af370` from the calling function. The 64-byte
+layout of the `BEGIN_TRANS` packet is documented in `minipro/src/t48.c`.
+
+## 6. Packet formats
+
+There are **four** distinct EP1 packet shapes used for eMMC operations,
+plus the optional EP2 OUT bulk payload.
+
+### Format A — 8-byte command via wrapper `0x492f30`
 
 ```c
-// Сигнатура: int sub_492f30(handle, byte opcode, dword arg3, ptr arg4)
-struct EP1_Command {
-    uint8_t  magic;    // = 0x27  (hardcoded, "'")
-    uint8_t  opcode;   // 0x46/0x4C/0x4D/0x50/0x57/0x5C/0x5D
-    uint16_t pad;      // = 0x0000
-    uint32_t arg3;     // 4-байтный параметр (LE)
+struct EP1_Cmd_A {        // send + short recv
+    uint8_t  top_opcode;  // = 0x27
+    uint8_t  sub_opcode;  // 0x46/0x4C/0x4D/0x50/0x57/0x5C/0x5D
+    uint16_t pad;         // = 0x0000
+    uint32_t arg;         // 4-byte LE argument
 };
-// → отправляется 8 байт на EP1 через sub_4dc380(handle, buf, 8)
+```
+**Use:** control commands (`CMD6 SWITCH`, `CMD13 STATUS`,
+`CMD23 SET_BLOCK_COUNT`, commit/finalize, etc.)
+
+### Format B — 8-byte command via wrapper `0x492900`
+
+```c
+struct EP1_Cmd_B {        // send + larger recv
+    uint8_t  top_opcode;  // = 0x08
+    uint8_t  sub_opcode;  // 0x48 = read 512-byte block
+    uint16_t length;      // expected reply length (e.g. 0x0200 = 512)
+    uint32_t arg;         // address / parameter
+};
+```
+**Use:** requests with variable reply (CMD8 `SEND_EXT_CSD` reads 512
+bytes via this path).
+
+### Format C — bulk write via wrapper `0x492670`
+
+```
+EP1 OUT: 16-byte setup, top-opcode = 0x14
+EP2 OUT: N × 512 bytes of payload (JEDEC RPMB frames or plain CMD25 blocks)
+```
+**Use:** `CMD25 WRITE_MULTIPLE_BLOCK`, RPMB writes.
+
+### Format D — bulk read via wrapper `0x492590`
+
+```c
+struct EP1_BulkRead_Setup {       // 16 bytes
+    uint32_t magic_and_op;        // = 0x02000015  (LE: bytes [15 00 00 02])
+                                  // top-opcode 0x02, sub-byte 0x15(?)
+    uint32_t reserved;            // = 0
+    uint16_t count;               // number of 512-byte blocks
+    uint16_t block_size;          // = 0x0200
+    uint16_t padding;             // = 0
+};
+// → send 16 bytes on EP1 OUT (pipe 1)
+// → recv (count * 512 + 16) bytes on EP1 IN (pipe 0x81): 16-byte header + bulk data
+```
+**Use:** `CMD18 READ_MULTIPLE_BLOCK`. Note that bulk read data comes
+back on EP1 IN (not EP2 IN).
+
+## 7. Key decoding: opcode `0x46` (CMD6 SWITCH)
+
+The 32-bit `arg` for sub-opcode `0x46`, stored in little-endian by the
+wrapper, **reads as the JEDEC eMMC CMD6 argument in big-endian**:
+
+```
+arg in LE memory       BE byte view             JEDEC CMD6 SWITCH argument
+─────────────────      ─────────────────        ─────────────────────────────
+                       [B3 B2 B1 B0]
+                       Access | Index | Value | CmdSet
 ```
 
-4-й аргумент `esi/arg4` — указатель/счётчик (out param для статуса), НЕ часть пакета. После send идёт recv ответа через `sub_4dc300`.
+`Access` ∈ `{0x01 Set-Bits, 0x02 Clear-Bits, 0x03 Write-Byte}`,
+`Index` ∈ ECSD field index (0–255), `Value` is the byte to write.
 
-## 8. Иерархия USB-обёрток
+**Commands decoded from `Xgpro.exe`:**
 
+| `arg` (LE) | BE bytes        | JEDEC ECSD field                                | Semantics                          |
+|------------|-----------------|-------------------------------------------------|------------------------------------|
+| `0x01B30300` | `01 B3 03 00` | `[179] PARTITION_CONFIG`, Set-Bits, Value `0x03`| **Switch to RPMB**                 |
+| `0x02B30700` | `02 B3 07 00` | `[179] PARTITION_CONFIG`, Clear-Bits, Value `0x07` | **Switch back to USER**         |
+| `0x01AF0100` | `01 AF 01 00` | `[175] HS_TIMING`, Set-Bits, Value `0x01`       | **Switch to HS-200** (init step)   |
+| `0x02FFFF00` | `02 FF FF 00` | ?                                               | early-init reset (TBD)             |
+
+So `CMD6 SWITCH` to any partition (BOOT1/BOOT2/RPMB/USER/GPP1–4) is
+simply sending a Format A packet with `sub_opcode = 0x46` and an `arg`
+that holds the BE-encoded JEDEC SWITCH argument.
+
+`PARTITION_ACCESS` field (bits [2:0] of ECSD index 179):
+
+| Value | Partition |
+|-------|-----------|
+| `0b000` | USER (default) |
+| `0b001` | BOOT1 |
+| `0b010` | BOOT2 |
+| `0b011` | RPMB |
+| `0b100..0b111` | GPP1..GPP4 |
+
+## 8. Format C internals — bulk write (`0x492670` → EP2)
+
+Inside `0x492670`, the 512-byte buffer that is sent on EP2 is built as
+a **JEDEC-compatible RPMB frame**, with exact field offsets:
+
+| Offset       | Size | Purpose                                                 | Matches JEDEC RPMB |
+|--------------|------|---------------------------------------------------------|---------------------|
+| `0x000..0x0C4` | 196 | Stuff bytes                                            | ✓ stuff bytes       |
+| `0x0C4..0x0E4` | 32  | Key/MAC (selected from internal table `0x79A690` or `0x7C8048`) | ✓ Authentication Key / MAC |
+| `0x0E4..0x1E4` | 256 | Data                                                   | ✓ Data              |
+| `0x1E4..0x1F4` | 16  | Random Nonce (`rand()`, optional)                      | ✓ Nonce             |
+| `0x1F4..0x1F8` | 4 BE | Write Counter                                         | ✓ Write Counter     |
+| `0x1F8..0x1FA` | 2   | Address                                                | ✓ Address           |
+| `0x1FA..0x1FC` | 2   | Block Count                                            | ✓ Block Count       |
+| `0x1FC..0x1FE` | 2   | Result                                                 | ✓ Result            |
+| `0x1FE..0x200` | 2   | Request / Response                                     | ✓ Request/Response  |
+
+**Transmission sequence:**
+
+1. EP1 OUT: 16-byte setup packet with top-opcode `0x14` (length `0x10`).
+2. EP2 OUT (`WinUsb_WritePipe(pipe=2)`): N × 512 bytes = RPMB frames.
+
+Flags `arg28 / arg2C` of the wrapper toggle nonce and key inclusion, so
+the same function also serves plain `CMD25` writes (without the RPMB
+key/MAC/nonce wrapping).
+
+## 9. Format D — bulk read (`0x492590` → EP1 IN)
+
+```c
+// 16-byte setup, magic 0x02 / sub-byte 0x15:
+struct EP1_BulkRead_Setup {
+    uint32_t magic_and_op;  // = 0x02000015
+    uint32_t reserved;      // = 0
+    uint16_t count;         // number of 512-byte blocks
+    uint16_t block_size;    // = 0x0200
+    uint16_t padding;       // = 0
+};
+// → 16 bytes on EP1 OUT (pipe 1)
+// → (count * 512 + 16) bytes on EP1 IN (pipe 0x81): 16-byte header + bulk data
 ```
-Уровень 3 (семантические команды eMMC):
-  0x4af370  — eMMC init (вызывает 0x492f30 дважды с opcode 0x46)
-  0x4acee0  — CMD12 + CMD13 (opcode 0x4C)
-  0x4ad240  — CMD13 alt (opcode 0x57, 0x50)
-  0x49d910  — CMD18/25 BGA-сокет
-  0x4a98f0  — CMD18/25 ISP (← наш кейс! через 0x492670)
-  0x4a8110  — bulk-read с watchdog
 
-Уровень 2 (USB-command builders):
-  0x492f30  — 8-байтная команда EP1 (101 вызов; opcodes 0x46/0x4C/0x4D/0x50/0x57/0x5C/0x5D)
-  0x492670  — bulk: 16-байт setup EP1 + N×512 на EP2  ← главный для eMMC данных
-  0x492590  — 64-байтная команда (вызывается из ISP-варианта; формат пакета TBD)
-  0x492900  — bulk-read (~512 байт)
-  0x4dc070  — общий wrapper (10 WritePipe-вызовов)
+Notable: EP2 IN does not appear to be used by Xgpro for eMMC. All bulk
+reads come back through EP1 IN.
 
-Уровень 1 (raw USB):
-  0x4dc380  — sub_send(handle, buf, len) → WinUsb_WritePipe(EP1)
-  0x4dc300  — sub_recv(handle, buf, len) → WinUsb_ReadPipe (EP1)
-  0x633e6c  — stub WinUsb_WritePipe (вызывается с EP=1 или EP=2)
-  0x633e66  — stub WinUsb_ReadPipe
-```
-
-## 9. Конкретный маппинг JEDEC CMD → пакет (по разобранным точкам)
-
-| JEDEC | Функция | Wrapper | Opcode | arg3 |
-|---|---|---|---|---|
-| init (CMD0/1/?) | 0x4af370 | `0x492f30` | **0x46** | `0x02FFFF00` затем `0x01AF0100` (два пакета подряд) |
-| CMD12 + CMD13 | 0x4acee0 | `0x492f30` | **0x4C** | `0` |
-| CMD13 (alt) | 0x4ad240 | `0x492f30` | **0x57**, **0x50** | `1`, `eax` (динамика) |
-| CMD18/25 ISP | 0x4a98f0 | `0x492670` (bulk) + `0x492590` (?64б) | — | edx/eax/edi (адреса буферов) |
-| EMMC init also | 0x4af370 | прямые `0x4dc380/0x4dc300` | (без обёртки) | 8-байт send + 8/24/32-байт recv (видимо, чтение статуса FPGA) |
-
-**Гипотезы по семантике opcode'ов** (нужно подтвердить):
-- `0x46` (59 вызовов) — самая частая: «отправить eMMC-CMD»; arg3 = упакованные данные команды (CMD-байт + 3 байта аргумента?). В init `0x02FFFF00` мог бы быть «CMD2 + ALL_SEND_CID stuff», `0x01AF0100` — «CMD1 + OCR».
-- `0x4C` — «stop+status» (CMD12+CMD13 в одной функции).
-- `0x57`, `0x50` — варианты статус-запроса с динамическими параметрами.
-- `0x4D`, `0x5C`, `0x5D` — редкие (по 1-4 вызова): партиция/режим/калибровка.
-
-## 9b. Точная сигнатура низкоуровневых send/recv (подтверждено дизасмом)
+## 10. Low-level send/recv functions (confirmed by disassembly)
 
 ```c
 // 0x4dc380 — sub_send(handle, buf, len)
 //   → WinUsb_WritePipe(h, PipeID=1, buf, len, &transferred, NULL)
-// EP1 OUT (= pipe ID 1)
+// EP1 OUT (pipe ID 1)
 
-// 0x4dc300 — sub_recv(handle, buf, len)  
+// 0x4dc300 — sub_recv(handle, buf, len)
 //   → WinUsb_ReadPipe(h, PipeID=0x81, buf, len, &transferred, NULL)
-// EP1 IN (= pipe ID 0x81)
-
-// EP1 двунаправленный: команды + статусные ответы.
-// Для bulk-данных eMMC переключается на EP2 (pipe ID = 2 OUT, 0x82 IN).
+// EP1 IN (pipe ID 0x81)
 ```
 
-## 9b-bis. УТОЧНЕНИЕ АРХИТЕКТУРЫ (важно): top-opcode + sub-opcode
+For bulk writes the wrapper calls `WinUsb_WritePipe` with `PipeID=2`
+directly (EP2 OUT).
 
-То, что в предыдущих разделах называлось «magic 0x27 + opcode» — это на самом деле **`top-opcode = 0x27` + `sub-opcode`** в общей схеме T48 protocol. Иерархия плоская:
-
-```
-Любой command-пакет EP1 = [byte 0: top-opcode] [byte 1..7: параметры/sub-opcode]
-```
-
-**Top-opcodes объединённой таблицы T48 (для T48 и eMMC):**
-
-| Top-opcode | Источник | Назначение | byte[1..7] |
-|---|---|---|---|
-| `0x02` | minipro (классика) | NAND_INIT | — |
-| `0x03` | minipro (классика) | **BEGIN_TRANSACTION** (init сессии: protocol_id, voltages, clock) | 64-байт пакет |
-| `0x04` | minipro | END_TRANSACTION | — |
-| **`0x05`** | minipro + Xgpro | **READID** — identify chip | 2-байт param (видим в init eMMC, recv 32б) |
-| **`0x06`** | minipro + Xgpro | **READ_USER** — config зона | recv 24б в init eMMC |
-| `0x07..0x1F` | minipro | классические операции | — |
-| **`0x08`** | Xgpro NEW (eMMC) | **«long-recv» обёртка** | byte 1 = sub-opcode (`0x48`=read 512б) + length + addr |
-| **`0x14`** | Xgpro NEW (eMMC) | **bulk-write setup** перед EP2 OUT | sub-opcode + count + block_addr |
-| **`0x21`** | Xgpro NEW (eMMC) | init/select-algorithm для eMMC | 1-байт параметр из конфига |
-| **`0x27`** | Xgpro NEW (eMMC) | **eMMC sub-command dispatcher** | sub-opcode + arg32 (см. ниже) |
-| `0x39` | minipro | REQUEST_STATUS | — |
-| `0x3F` | minipro | RESET | — |
-
-**Sub-opcodes под top-opcode `0x27` (eMMC subcommands):**
-
-| Sub-op | Семантика | arg32 |
-|---|---|---|
-| `0x46` | **CMD6 SWITCH** | BE-encoded JEDEC: `[Access][Index][Value][CmdSet]` |
-| `0x4C` | **CMD12 STOP + CMD13 STATUS** | `0` |
-| `0x4D` | **commit / finalize FPGA** (password/RPMB) | — |
-| `0x50` | **data transfer 512 байт** (CMD24/OTP/RPMB) | `0x200` |
-| `0x57` | **CMD23 SET_BLOCK_COUNT** | количество блоков (обычно `1`) |
-| `0x5C` | TBD (1 вызов) | — |
-| `0x5D` | **Read WGP table** (write group protection) | — |
-
-**Sub-opcode под top-opcode `0x08`:**
-
-| Sub-op | Семантика |
-|---|---|
-| `0x48` | **CMD8 SEND_EXT_CSD / CMD17 READ_SINGLE_BLOCK** (recv 512 байт) |
-
-## 9b-tris. Init-последовательность eMMC
-
-Реверс функции `0x4af370` (eMMC init sub-этап, вызываемой после `BEGIN_TRANS`):
+## 11. Wrapper hierarchy in `Xgpro.exe`
 
 ```
-Шаг 1: top-opcode 0x21 + 1-байт параметр [из 0x7485d0]   → recv 8 байт
-       (предположительно «select algorithm/variant» для eMMC)
+Layer 3 — semantic eMMC commands:
+  0x4af370   eMMC init sub-step (calls 0x492f30 twice with sub-op 0x46)
+  0x4acee0   CMD12 + CMD13 (sub-op 0x4C)
+  0x4ad240   CMD13 alt path (sub-ops 0x57, 0x50)
+  0x49d910   CMD18/25 BGA-socket path
+  0x4a98f0   CMD18/25 ISP path (← our case! uses 0x492670)
+  0x4a8110   bulk-read with watchdog
 
-Шаг 2: top-opcode 0x05 (READID) + 2-байт параметр [0x7a39cc]  → recv 32 байта
-       (chip ID / OCR / CID)
+Layer 2 — USB-command builders:
+  0x492f30   8-byte EP1 command, top-opcode 0x27 (Format A, 101 call sites)
+  0x492670   bulk: 16-byte EP1 setup + N×512 on EP2 (Format C, RPMB-aware)
+  0x492590   bulk-read: 16-byte EP1 setup + EP1 IN read (Format D)
+  0x492900   8-byte EP1 command, top-opcode 0x08 (Format B, 0x48 = read 512 B)
+  0x4dc070   composite EP1 transaction wrapper (10 WritePipe call sites)
 
-Шаг 3: top-opcode 0x06 (READ_USER)                            → recv 24 байта
-       (конфиг или CSD)
-
-Шаг 4: top-opcode 0x27, sub 0x46 (CMD6 SetBits HS_TIMING=0x01)  → перевод в HS-200
-Шаг 5: top-opcode 0x27, sub 0x46 (CMD6 ...)                     → ещё одна ECSD-настройка
+Layer 1 — raw USB:
+  0x4dc380   sub_send → WinUsb_WritePipe(EP1)
+  0x4dc300   sub_recv → WinUsb_ReadPipe(EP1 IN)
+  0x633e6c   stub for WinUsb_WritePipe (called with PipeID 1 or 2)
+  0x633e66   stub for WinUsb_ReadPipe
 ```
 
-Тонкость: `BEGIN_TRANSACTION` (0x03) с конкретным `protocol_id = 0x31 (IC2_ALG_EMMC)` и `variant` (например `0x4100` для ISP 1-bit) выдается ДО `0x4af370` из caller-функций. Структура `BEGIN_TRANS` пакета в minipro/src/t48.c — 64 байта (см. раздел 8 этого документа).
+## 12. JEDEC CMD → packet (decoded points)
 
-## 9c. Wrapper'ы 8-байтных команд (есть ДВА разных формата!)
+| JEDEC CMD       | Function | Wrapper(s)             | top/sub-op | arg32                                                        |
+|-----------------|----------|-------------------------|------------|--------------------------------------------------------------|
+| init (CMD0/1/?) | 0x4af370 | `0x492f30`             | 0x27/0x46  | `0x02FFFF00` then `0x01AF0100` (two packets)                 |
+| CMD12 + CMD13   | 0x4acee0 | `0x492f30`             | 0x27/0x4C  | `0`                                                          |
+| CMD13 (alt)     | 0x4ad240 | `0x492f30`             | 0x27/0x57, 0x27/0x50 | `1`, then variable                                 |
+| CMD8 EXT_CSD    | 0x4a1130 | `0x492900`             | 0x08/0x48  | length=`0x0200`, arg=`0`                                     |
+| CMD18 ISP       | 0x4a98f0 | `0x492590` + `0x492670`| 0x02/0x15  | block_count                                                  |
+| CMD25 ISP write | 0x4a98f0 | `0x492670`             | 0x14/…     | + EP2 OUT payload (RPMB frame layout)                        |
+| init handshake  | 0x4af370 | raw `0x4dc380/0x4dc300`| 0x21, 0x05, 0x06 | recv 8/32/24 bytes respectively                        |
 
-### Формат A — opcode `0x27` magic (через `0x492f30`)
-```c
-struct EP1_Cmd_A {  // отправка + ожидание короткого ответа
-    uint8_t  magic = 0x27;
-    uint8_t  opcode;     // 0x46/0x4C/0x4D/0x50/0x57/0x5C/0x5D
-    uint16_t pad = 0;
-    uint32_t arg;
-};
-```
-Применение: **управляющие команды** (CMD6 SWITCH, CMD13 STATUS, etc.)
+## 13. `.alg` algorithm-file format
 
-### Формат B — opcode `0x08` magic (через `0x492900`)
-```c
-struct EP1_Cmd_B {  // отправка + ожидание большого ответа (через EP1 или EP2)
-    uint8_t  magic = 0x08;
-    uint8_t  opcode;     // 0x48 (?)
-    uint16_t length;     // размер ожидаемых данных (например 0x200 = 512)
-    uint32_t arg;        // адрес/параметр
-};
-```
-Применение: **запросы с переменным ответом** (CMD8 SEND_EXT_CSD читает 512 байт)
-
-### Формат C — bulk write через `0x492670`
-```
-EP1 setup (16 байт) + EP2 OUT (N×512 байт данных)
-```
-Применение: **CMD25 WRITE_MULTIPLE_BLOCK** (запись eMMC через ISP)
-
-### Формат D — bulk read через `0x492590`
-```
-EP1 setup (16 байт, magic=0x02/0x15) + EP1 IN (16 байт header + N×512 байт данных)
-```
-Применение: **CMD18 READ_MULTIPLE_BLOCK** (чтение eMMC; данные приходят на EP1 IN с заголовком)
-
-## 9d. КЛЮЧЕВОЕ ОТКРЫТИЕ: кодировка `arg` для opcode `0x46` = JEDEC CMD6 SWITCH в big-endian
-
-`arg3` DWORD в LE-памяти, прочитанный как BE-байты, **точно соответствует аргументу JEDEC eMMC CMD6**:
+The Xgpro algorithm files (`xgecu/algorithm/*.alg`) contain compressed
+FPGA bitstreams. The format is fully reverse-engineered and the
+`tools/extract_alg.py` script in this repository round-trips every
+shipped `.alg` correctly.
 
 ```
-arg3 (LE storage)    BE-байты           JEDEC CMD6 SWITCH аргумент
-─────────────────    ────────────       ─────────────────────────────
-                     [B3 B2 B1 B0]
-                     Access | Index | Value | CmdSet
+0x000              char[]   algorithm-family name, ASCII, \0-terminated
+                            (e.g. "EMMC211210", "EMMC18", "SPI-18", "AT45DB")
+0x000..0x220       —        header padded with zeros (some families
+                            keep sparse parameters here)
+0x220              u32 LE   decompressed bitstream size = 340604
+                            (constant for every shipped .alg — implies
+                            a single FPGA, ≈ Xilinx Spartan-6 LX9 class)
+0x224              u32 LE   CRC32 of the compressed data
+                            = (zlib.crc32(comp) XOR 0xFFFFFFFF)
+0x228..end         …        compressed bitstream, zero-RLE over 16-bit words:
+                              read u16 val;
+                              if val != 0: emit val
+                              else:        read u16 len; emit `len` zero-words
 ```
 
-Где `Access` ∈ {01=Set-Bits, 02=Clear-Bits, 03=Write-Byte}, `Index` ∈ ECSD-индекс (0-255), `Value` — записываемое значение.
+The decompressed payload starts with the standard FPGA bitstream
+preamble: 16 × `0xFF` dummy bytes followed by the sync word
+`AA 99 55 66` (canonical Xilinx Spartan-6 sync).
 
-**Расшифрованные команды из реверса:**
+### `variant` ↔ `.alg` file (via the high byte of `variant`)
 
-| arg3 (LE) | BE-байты | JEDEC ECSD поле | Семантика |
-|---|---|---|---|
-| `0x01B30300` | `01 B3 03 00` | `[179] PARTITION_CONFIG`, Set-Bits, Value=`0x03` | **Switch to RPMB** |
-| `0x02B30700` | `02 B3 07 00` | `[179] PARTITION_CONFIG`, Clear-Bits, Value=`0x07` | **Switch back to USER** |
-| `0x01AF0100` | `01 AF 01 00` | `[175] HS_TIMING`, Set-Bits, Value=`0x01` | **Перевод в HS-200** (init) |
-| `0x02FFFF00` | `02 FF FF 00` | ? | начальный reset (TBD) |
+The chip database (`InfoIC2Plus.dll`) stores per-chip `variant`s like
+`0x5300`, `0x4100`, etc. The **high byte** of `variant` is the
+algorithm number that gets substituted into the algorithm filename:
 
-Это означает: **CMD6 SWITCH к любому разделу (BOOT1/BOOT2/RPMB/USER/GPP1-4) — это просто отправка пакета формата A с opcode=0x46 и arg3=BE-encoded JEDEC аргумент**.
+| `variant` high byte | Name pattern    | `.alg` file              | Mode                  |
+|---------------------|-----------------|--------------------------|-----------------------|
+| `0x53`              | `_8Bit @BGA153` | `EMMC_53_{18,33}.alg`    | BGA socket, 8-bit bus |
+| `0x54`              | `_4Bit @BGA153` | `EMMC_54_{18,33}.alg`    | BGA socket, 4-bit bus |
+| `0x51`              | `_1Bit @BGA153` | `EMMC_51_{18,33}.alg`    | BGA socket, 1-bit bus |
+| `0x44`              | `(ISP) _4Bit`   | `EMMC_44_{18,33}.alg`    | **ISP 4-bit**         |
+| `0x41`              | `(ISP) _1Bit`   | `EMMC_41_{18,33}.alg`    | **ISP 1-bit**         |
 
-Полная карта PARTITION_ACCESS (биты [2:0] PARTITION_CONFIG):
-- `000` = USER (default)
-- `001` = BOOT1
-- `010` = BOOT2
-- `011` = RPMB
-- `100`..`111` = GPP1..GPP4
+The `_18` / `_33` suffix is `VCCQ = 1.8 V` / `3.3 V`.
 
-## 9e. Полная таблица опкодов eMMC
+## 14. Chip database
 
-| Opcode | Wrapper | Семантика | Подтверждение |
-|---|---|---|---|
-| **0x46** | `0x492f30` (фмт A) | **CMD6 SWITCH** (BE-encoded JEDEC arg) | расшифровка arg3: SetBits/ClearBits + Index + Value |
-| **0x48** | `0x492900` (фмт B) | **Read 512-byte block** (CMD8/CMD17, BOOT-страница) | вызывается 3 раза с size=0x200 в функции Read ECSD |
-| **0x4C** | `0x492f30` (фмт A) | **CMD12 STOP + CMD13 STATUS** | строки " -- CMD12" / "CMD13" в той же функции |
-| **0x4D** | `0x492f30` | Commit / finalize FPGA | контекст: "Set Password", "Password Reset", RPMB финализация |
-| **0x50** | `0x492f30` | 512-байтный data transfer (CMD24 / OTP / CSD / RPMB-write) | в паре с 0x57; всегда arg3=0x200; контекст CSD/PWD/RPMB |
-| **0x57** | `0x492f30` | **CMD23 SET_BLOCK_COUNT** (всегда arg3=1) | контекст: "Device write error : CMD23" во ВСЕХ 4 функциях |
-| `0x5C` | `0x492f30` | TBD (1 вызов, нет якорных строк) | низкий приоритет |
-| **0x5D** | `0x492f30` | Read Write Group Protection table | строка "No respond to read WGP protection table" |
+`InfoIC2Plus.dll` ships with `Xgpro` and contains the per-chip
+parameters consumed by `BEGIN_TRANSACTION`. The `dumpic/dump-infoic2plus-dll.c`
+utility in `minipro` extracts it to JSON.
 
-## 9h. Расшифровка формата C — bulk write (0x492670 → EP2)
+For the Xgpro version we examined, the database contains:
 
-Внутри 0x492670 строится **JEDEC-совместимая RPMB frame** в 512-байтном буфере, затем шлётся на EP2. Точные смещения:
+- 173 manufacturers, 34 352 chip entries in total.
+- **4 796 eMMC entries** (chip type `7`), all with `protocol_id = 0x31`.
 
-| Смещение | Размер | Назначение | Соответствует JEDEC RPMB |
-|---|---|---|---|
-| `0x000..0x0C4` | 196 | Stuff bytes | ✓ stuff bytes |
-| `0x0C4..0x0E4` | 32 | Key/MAC (выбор из таблиц `0x79A690` или `0x7C8048`) | ✓ Authentication Key / MAC |
-| `0x0E4..0x1E4` | 256 | Data | ✓ Data |
-| `0x1E4..0x1F4` | 16 | Random Nonce (`rand()`, опционально) | ✓ Nonce |
-| `0x1F4..0x1F8` | 4 BE | Write Counter | ✓ Write Counter |
-| `0x1F8..0x1FA` | 2 | Address | ✓ Address |
-| `0x1FA..0x1FC` | 2 | Block Count | ✓ Block Count |
-| `0x1FC..0x1FE` | 2 | Result | ✓ Result |
-| `0x1FE..0x200` | 2 | Req/Resp | ✓ Request/Response |
-
-**Последовательность отправки:**
-1. EP1 OUT: 16-байтный setup-пакет с magic `0x14` (length=0x10).
-2. EP2 OUT (через `WinUsb_WritePipe(pipe=2)`): N×512 байт = RPMB frames.
-
-Флаги `arg28/arg2C` управляют включением nonce/key, так что та же функция работает и для обычного CMD25 без RPMB-обвески.
-
-## 9i. Расшифровка формата D — bulk read (0x492590 → EP1 IN)
-
-```c
-// 16-байтный setup-пакет, magic 0x02:
-struct EP1_BulkRead_Setup {
-    uint32_t magic_and_op = 0x02000015;   // bytes [15 00 00 02] LE — magic 0x02, op-byte 0x15
-    uint32_t reserved = 0;
-    uint16_t count;                       // число 512-байт блоков
-    uint16_t block_size = 0x200;
-    uint16_t padding = 0;
-};
-// → send 16 bytes on EP1 OUT (pipe=1)
-// Затем:
-// → recv (count * 512 + 16) bytes on EP1 IN (pipe=0x81) — bulk-данные с 16-байт header'ом
-```
-
-Интересно: EP2 IN, видимо, не используется (или используется в редких путях). **Все bulk-чтения идут через EP1 IN.** EP2 OUT — только для write-фреймов (RPMB/CMD25).
-
-## 9f. Адресная карта буфера (из строк UI Xgpro)
+## 15. Buffer address map (from Xgpro UI strings)
 
 ```
-BOOT1 last page : буфер 0x10000-0x13FFF (16 КБ), устройство 0x1FC50000-0x1FC53FFF
-BOOT2 last page : буфер 0x30000-0x33FFF (16 КБ), устройство 0x1FC70000-0x1FC73FFF
+BOOT1 last page : buffer 0x10000-0x13FFF (16 KB), device 0x1FC50000-0x1FC53FFF
+BOOT2 last page : buffer 0x30000-0x33FFF (16 KB), device 0x1FC70000-0x1FC73FFF
 ```
-(Примечание: адреса устройства зависят от ёмкости конкретной eMMC.)
 
-## 9g. Поток операций для типичных задач (черновик)
+The device-side addresses depend on the actual eMMC capacity; the
+buffer-side addresses are what Xgpro uses internally.
 
-### Чтение ECSD (512 байт)
+## 16. Operation sketches (draft)
+
+### Read EXT_CSD (512 bytes)
+
 ```
-0. (предположительно) begin_transaction подобно minipro:
-   handshake/инициализация устройства, выбор protocol_id=0x31, variant (наприм. 0x4100 для ISP 1-bit)
+0. begin_transaction (top-op 0x03) with protocol_id = 0x31 and
+   variant for the target chip (e.g. 0x4100 for ISP 1-bit)
 1. eMMC init: CMD0 → CMD1 (OCR) → CMD2 (CID) → CMD3 → CMD7
-   Реализовано в Xgpro через серию обращений к 0x4dc380/0x4dc300 + CMD6 SetBits HS_TIMING=1
-2. EP1 cmd format-B: magic=0x08, opcode=0x48, length=0x200, arg=0
-   → recv 512-byte ECSD
+   Implemented in Xgpro through a sequence of 0x21/0x05/0x06 raw
+   commands + CMD6 SetBits HS_TIMING=1
+2. EP1 cmd Format B: top-op=0x08, sub-op=0x48, length=0x200, arg=0
+   → recv 512-byte EXT_CSD
 ```
 
-### Чтение BOOT1 (16 КБ)
-```
-1. CMD6 SWITCH: opcode=0x46, arg=encode(SetBits, PARTITION_CONFIG=0xB3, Value=0x01)  // Access=BOOT1
-2. Цикл по блокам: EP1 cmd format-B opcode=0x48 length=0x200 arg=block_addr (или bulk-чтение через 0x492590)
-3. CMD6 SWITCH назад: opcode=0x46, arg=encode(ClearBits, 0xB3, 0x07)  // вернуть к USER
-```
+### Read BOOT1 (16 KB)
 
-### Чтение USER (bulk через ISP)
 ```
-1. CMD18 setup через 0x492590 (16-byte EP1 setup) с числом блоков = N
-2. Получение N×512 байт через EP1 IN (с 16-байтным header)
-3. CMD12 STOP опционально (opcode 0x4C)
+1. CMD6 SWITCH: sub-op=0x46, arg = encode(SetBits, 0xB3=PARTITION_CONFIG, Value=0x01)
+2. Iterate over blocks: EP1 cmd Format B with sub-op=0x48, length=0x200,
+   arg=block_address, OR bulk-read via 0x492590
+3. CMD6 SWITCH back: sub-op=0x46, arg = encode(ClearBits, 0xB3, 0x07)
 ```
 
-## 10. Открытые вопросы
+### Read USER area (bulk read via ISP)
 
-- [ ] Точная семантика 7 опкодов (поможет дамп для верификации).
-- [ ] Формат и размер пакета `0x492590` (видим только размер 0x40=64 байта).
-- [ ] Формат ответа на EP1 (видны recv-размеры 8, 24, 32 — какие поля).
-- [ ] Триггер EP2-чтения после CMD18 (как Xgpro узнаёт, что FPGA готов отдать данные).
-- [ ] Релэй аутентификации фирменного eMMC-ISP адаптера (если ПК участвует).
-- [ ] Полная таблица опкодов 0x40-0x60 (возможно, есть незадействованные в eMMC).
+```
+1. CMD18 setup via 0x492590 (16-byte EP1 OUT setup) with N = block count
+2. Receive N × 512 bytes on EP1 IN (with 16-byte response header)
+3. Optionally CMD12 STOP (sub-op 0x4C)
+```
 
-## 11. Ход проекта — итог по этой сессии
+## 17. Open questions
 
-✅ minipro 0.7.4 собран, бинарь готов (`/path/to/minipro/minipro`)
-✅ БД 4796 eMMC-чипов выгружена (`emmc_chips_t48.json`)
-✅ Формат `.alg` разобран и верифицирован, есть распаковщик
-✅ VID:PID, endpoint-схема, иерархия обёрток установлены
-✅ Структура 8-байтной EP1-команды зафиксирована
-✅ Список eMMC-опкодов извлечён, частично сопоставлен с JEDEC
-⏳ Точная семантика opcode'ов (нужен USB-дамп для финальной валидации)
-⏳ Bulk EP2 — формат setup-пакета и поток данных
-⏳ Командный поток в самой ISP-функции (там есть свой формат 64-байт)
+- [ ] Exact semantics of every sub-opcode (USB capture will validate
+      the proposed mapping).
+- [ ] Final word on the 16-byte setup-packet payload for Format D
+      (the `0x02000015` magic is confirmed; the trailing fields are
+      inferred).
+- [ ] Reply framing on EP1 — observed reply sizes are 8 / 24 / 32 /
+      `count*512+16`; the field layouts are not yet decoded.
+- [ ] How Xgpro learns the FPGA is ready to deliver bulk data on EP1
+      IN after `CMD18` (the trigger / handshake).
+- [ ] Adapter-authentication pass-through: if the PC software ever
+      relays the auth bytes between the genuine eMMC-ISP adapter and
+      the T48 firmware (we expect not — see §18).
+- [ ] Full opcode table in the `0x40..0x60` range (there may be unused
+      sub-opcodes that Xgpro doesn't exercise for eMMC).
 
-## 8. Адаптер с крипточипом
+## 18. The crypto-equipped eMMC-ISP adapter
 
-Адаптер «XGecu EMMC-ISP VER 1.00» содержит secure-auth IC (вероятно ATSHA204A-класс):
-- Аутентифицируется к **прошивке T48**, не к ПК-софту.
-- Для своего ПО ломать его НЕ нужно — пускаем команды как есть, прошивка сама ведёт диалог с адаптером.
-- Если в USB-обмене обнаружится pass-through aуть-байтов — это просто релэй (без знания ключа).
+The genuine **"XGecu EMMC-ISP VER 1.00"** adapter contains a secure
+authentication IC (likely an Atmel/Microchip ATSHA204A or similar).
+Per the manufacturer's product page the chip is anti-clone protection;
+the adapter "cannot be DIY" and is locked to the T48 model only (not
+the older TL866 family, and not the T56).
+
+The relevant fact for this project: the adapter **authenticates to the
+T48's firmware**, not to the PC software. Our PC code therefore does
+not need to break the crypto — it just issues the documented USB
+commands, and the T48 firmware itself runs the challenge/response with
+the adapter using a key shared between them (likely sealed inside both
+parts of the system).
+
+If a future USB capture turns out to show the PC relaying auth bytes,
+that would be plain pass-through (no key knowledge needed on the host).
 
 ---
+
+## Status checklist
+
+✅ minipro 0.7.4 built and confirmed to run<br>
+✅ Chip database dumped (4 796 eMMC entries)<br>
+✅ `.alg` format fully reverse-engineered and verified (unpacker
+round-trips every file)<br>
+✅ USB identity, endpoint map, wrapper hierarchy established<br>
+✅ Format A 8-byte EP1 packet documented<br>
+✅ eMMC sub-opcode list extracted, 6 of 7 mapped to JEDEC semantics<br>
+✅ CMD6 SWITCH argument encoding fully decoded<br>
+✅ RPMB frame layout (Format C internals) fully decoded<br>
+⏳ Final byte-level validation of every opcode (needs a USB capture
+   from a real T48)<br>
+⏳ The 16-byte setup payload for Format D (inferred, not yet directly
+   verified)<br>
