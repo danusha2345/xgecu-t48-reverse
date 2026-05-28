@@ -1,3 +1,5 @@
+[![Boosty](https://img.shields.io/badge/Boosty-Buy_me_a_coffee-FF7143?logo=boosty&logoColor=white&style=for-the-badge)](https://boosty.to/danusha/donate)
+
 # xgecu-t48-reverse
 
 Reverse-engineered USB protocol notes and a Python prototype for talking
@@ -134,3 +136,7 @@ side of the device family.
 [MIT](LICENSE). Reverse engineering for the purpose of interoperability
 between independently-developed software and the hardware its owner
 purchased.
+
+---
+
+[![Boosty](https://img.shields.io/badge/Boosty-Buy_me_a_coffee-FF7143?logo=boosty&logoColor=white&style=for-the-badge)](https://boosty.to/danusha/donate)
