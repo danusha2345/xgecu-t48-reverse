@@ -1058,7 +1058,62 @@ This lets the host verify what the DAC is *actually* outputting,
 including before connecting a chip. Match against what was requested as
 a sanity check.
 
-### 21.4 Where eMMC fits in
+### 21.4 Hardware capability vs. firmware/UI restriction
+
+There are two distinct layers of "what voltage is allowed":
+
+**A. T48 hardware (the DACs themselves):**
+
+| Rail   | Steps | Range                    | Resolution |
+|--------|------:|--------------------------|------------|
+| VCC    |    64 | 1.74 .. 6.86 V           | ~80 mV     |
+| VPP    |    64 | 9.31 .. 25.16 V          | ~250 mV    |
+| VCCIO  |     5 | {2.35, 2.47, 2.93, 3.23, 3.45} V | — |
+
+The DACs are not arbitrary — they're 64-step lookups — but for VCC and
+VPP the resolution is fine enough to cover ~any sensible target voltage.
+
+**B. Xgpro UI / firmware logic (the presets actually offered):**
+
+For *classic* chips the UI menu offers a discrete set of about a dozen
+values: `1.20 / 1.80 / 2.50 / 3.00 / 3.30 / 4.00 / 4.50 / 4.75 / 5.00 /
+5.25 / 5.50 / 6.00 / 6.25 / 6.50 V`, each combinable with a `±0.3 V`
+fine-trim in `0.1 V` steps. So in practice for a classic chip you can
+hit pretty much any voltage your datasheet asks for, in `100 mV` steps.
+
+For *eMMC* the UI is far more restrictive — only the three JEDEC IO
+classes plus the same fine-trim:
+
+```
+VCC  = 3.0 V (fixed)
+VCCQ ∈ {1.2 V, 1.8 V, 3.0 V}     ← selected via chip's `variant` field
+fine-trim: VCC and VCCQ each ±0.3 V in 0.1 V steps
+```
+
+This is **not** because the hardware can't do other values — it can.
+It's because JEDEC defines eMMC IO voltages as discrete classes, and a
+real eMMC controller is only specified to behave correctly inside one of
+those three windows. Setting `VCCQ = 2.5 V` would put the chip's I/O
+deck in an undefined zone — best case it just refuses commands, worst
+case it latches up.
+
+**Can we expose arbitrary VCC/VCCQ in our own software?**
+
+For the *classic-chip* path: yes — `set_vcc_voltage(0..63)` and
+`set_vpp_voltage(0..63)` already give 64-step control directly.
+
+For the *eMMC* path: **don't**. The voltages are encoded inside the
+64-byte `BEGIN_TRANSACTION` packet via the chip's `variant`. Picking
+the wrong variant (e.g. the `_33` suffix on a 1.8 V chip) destroys the
+chip in milliseconds — see §22.6. The right knob to expose to the user
+is the *chip selection* (with VCCQ derived from the chip's datasheet),
+not a freeform voltage spinbox.
+
+If you really need an off-class VCCQ — say, characterising chip
+behaviour at 2.0 V — do it on a sacrificial part with
+`set_vcc_voltage()` directly, never on the device you care about.
+
+### 21.6 Where eMMC fits in
 
 For eMMC sessions Xgpro does **not** invoke `SET_VCC_VOLTAGE` or
 `SET_VPP_VOLTAGE` separately. The voltages get encoded into the 64-byte
