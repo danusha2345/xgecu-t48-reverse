@@ -294,15 +294,56 @@ class T48Emmc:
         self.ep1_send(pack_cmd_A(EmmcSubOp.STOP_AND_STATUS, 0))
         return self.ep1_recv(8)
 
+    # ---- init (no BEGIN_TRANSACTION needed for eMMC!) ----
+    def init_emmc(self, algo_param: int, readid_param: int = 0) -> dict:
+        """
+        eMMC start-up: opcode 0x21 → 0x05 → 0x06. This subsumes
+        BEGIN_TRANSACTION for the eMMC path (the main Xgpro dispatcher
+        never sends opcode 0x03 for eMMC).
+
+        Returns a dict with parsed OCR / CID / CSD bytes.
+
+        :param algo_param: 1-byte algorithm/variant selector
+                           (= DAT_007485d0, set by Xgpro from chip variant)
+        :param readid_param: 2-byte parameter for opcode 0x05 (= DAT_007a39cc)
+        """
+        # Step 1 — opcode 0x21 + 1-byte param → recv 8 B (status + OCR)
+        self.ep1_send(struct.pack('<BB6x', 0x21, algo_param & 0xFF))
+        r1 = self.ep1_recv(8)
+        ocr = struct.unpack_from('<I', r1, 4)[0] if r1[1] == 0 else None
+
+        # Step 2 — opcode 0x05 + u16 param → recv 32 B (status + CID)
+        self.ep1_send(struct.pack('<BBHI', 0x05, 0, readid_param & 0xFFFF, 0))
+        r2 = self.ep1_recv(0x20)
+        cid = bytes(r2[8:0x18]) if r2[1] == 0 else None
+
+        # Step 3 — opcode 0x06 → recv 24 B (status + CSD)
+        self.ep1_send(struct.pack('<BB6x', 0x06, 0))
+        r3 = self.ep1_recv(0x18)
+        csd = bytes(r3[8:0x18]) if r3[1] == 0 else None
+
+        return {'ocr': ocr, 'cid': cid, 'csd': csd,
+                'replies': (r1, r2, r3)}
+
+    def set_pipe_timeout(self, timeout_ms: int) -> None:
+        """
+        Call WinUsb_SetPipePolicy equivalent — sets PIPE_TRANSFER_TIMEOUT on
+        IN pipes 0x81/0x82/0x83. pyusb doesn't expose this directly; on Linux
+        the read() timeout argument plays the same role per-call.
+        """
+        self.read_timeout_ms = timeout_ms
+
     # ---- bulk read (USER/BOOT via CMD18) ----
     def bulk_read(self, count_sectors: int) -> bytes:
         """
-        Format D bulk read: send the setup packet on EP1 OUT and receive
-        the bulk data on EP1 IN. TODO: there may be a required prologue
-        (SET_BLOCK_COUNT and/or an address-set command).
+        Format D bulk read for eMMC: send setup on EP1 OUT, receive bulk
+        data on EP2 IN (Ghidra-verified in 0x4dbd50 — for chip_type==7).
+        Total received size = count*512 + 16 (16-byte trailing header).
+        TODO: there may be a required prologue (CMD23 SET_BLOCK_COUNT,
+        address-set, etc.) — confirm with a USB capture.
         """
         self.ep1_send(pack_bulk_read_setup(count_sectors))
-        return self.ep1_recv(16 + count_sectors * 512)
+        return self.ep2_recv(16 + count_sectors * 512)
 
     # ---- bulk write (USER/BOOT/RPMB) ----
     def bulk_write(self, opcode: int, count_sectors: int, block_addr: int, payload: bytes) -> int:

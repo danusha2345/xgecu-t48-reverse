@@ -611,4 +611,96 @@ FUN_00492900(handle, 0x48, 0x200, 0, recv_buf);   // x3
 EXT_CSD; если совпадают — данные надёжные). Стандартная защитная
 практика для длинных ISP-линий.
 
+### 19.10 Layout ответов init-команд
+
+```
+Ответ 8 байт на opcode 0x21 (INIT_EMMC):
+  byte 1     : status (0 = OK)
+  byte 4..8  : u32 = OCR register (стандарт JEDEC eMMC, raw)
+               bit 30 = high-capacity flag
+               bits [23:8] должны быть 0xFF8080 для 1.8V
+
+Ответ 32 байта на opcode 0x05 (READID → CID):
+  byte 1       : status
+  byte 8..0x18 : 16 байт = CID register (128-bit unique chip ID)
+
+Ответ 24 байта на opcode 0x06 (READ_USER → CSD):
+  byte 1       : status
+  byte 8..0x18 : 16 байт = CSD register (128-bit Card-Specific Data)
+```
+
+CID и CSD сохраняются в глобальный буфер `DAT_007a4034`: CID на offset 0,
+CSD на offset 0x10. Высокоуровневый код читает их прямо оттуда.
+
+### 19.11 `FUN_004dbd50` — bulk-read для eMMC, точно
+
+```c
+void bulk_read_emmc(handle, buf, size) {
+    int chip_type = chip_type_table[slot * 0xEC];
+    if (chip_type == 6)        raw_recv(handle, buf, size);        // NAND: EP1 IN
+    else if (chip_type == 7 || chip_type == 8)
+        WinUsb_ReadPipe(handle, 0x82, buf, size, ...);            // eMMC/VGA: EP2 IN
+    else if (size >= 0x41) {
+        // Параллельное чтение: EP2 IN + EP3 IN, по половине размера
+        WinUsb_ReadPipe(handle, 0x82, buf, size/2, ...);
+        WinUsb_ReadPipe(handle, 0x83, buf+size/2, size/2, ...);
+    }
+}
+```
+
+Подтверждено: **eMMC bulk-read = EP2 IN (pipe 0x82)**. Для не-eMMC больших
+чтений Xgpro полосует на **EP2 IN + EP3 IN**.
+
+### 19.12 `FUN_004dbd00` — это `WinUsb_SetPipePolicy`, не "set timeout"
+
+```c
+WinUsb_SetPipePolicy(handle, 0x81, PIPE_TRANSFER_TIMEOUT, 4, &timeout_ms);
+WinUsb_SetPipePolicy(handle, 0x82, PIPE_TRANSFER_TIMEOUT, 4, &timeout_ms);
+WinUsb_SetPipePolicy(handle, 0x83, PIPE_TRANSFER_TIMEOUT, 4, &timeout_ms);
+```
+
+Подтверждает, что **EP3 IN (pipe 0x83) реально существует** в дескрипторе.
+
+### 19.13 `BEGIN_TRANSACTION` (top-opcode `0x03`) для eMMC **НЕ нужен**
+
+В главном диспетчере eMMC `FUN_004c9110` (~1700 строк декомпиляции) —
+**4 вызова `FUN_004af370` (init sub-step) и только 1 raw send**, нигде
+нет top-opcode `0x03`. То есть:
+
+- **Нашему ПО НЕ нужно слать 64-байтный `BEGIN_TRANSACTION` для eMMC.**
+- Роль `BEGIN_TRANSACTION` (выбор алгоритма + voltages) для eMMC играет
+  **opcode `0x21`** с 1-байт параметром из `DAT_007485d0` (Xgpro
+  устанавливает его раньше по выбору `variant` пользователем).
+- Практический вывод: start-up в прототипе упрощается до
+  `connect()` → opcode `0x21` (+param) → `0x05` → `0x06` → CMD6 SWITCH HS-200.
+
+### 19.14 Полная карта endpoint'ов (после Ghidra)
+
+| Pipe ID | Направление | Роль                                                |
+|---------|-------------|-----------------------------------------------------|
+| `0x01`  | EP1 OUT     | Все команды; combined 528-byte для не-eMMC          |
+| `0x02`  | EP2 OUT     | Bulk-write payload для eMMC                         |
+| `0x03`  | EP3 OUT     | Параллельная половина больших не-eMMC записей       |
+| `0x05`  | EP5 OUT     | Только VGA bulk-write                               |
+| `0x81`  | EP1 IN      | Все короткие ответы (8/24/32 байт)                  |
+| `0x82`  | EP2 IN      | Format B reply для eMMC; bulk-read eMMC + VGA       |
+| `0x83`  | EP3 IN      | Параллельная половина больших не-eMMC чтений        |
+
+Для нашего eMMC ISP пути нужны только **EP1 OUT/IN и EP2 OUT/IN**.
+
+### 19.15 Новый top-opcode `0x26` — FPGA bitstream download
+
+`FUN_004bb4d0` (`download_algo`) реализует загрузку FPGA-битстрима с PC
+для **VGA** (chip_type 8) и, возможно, других «download from PC» случаев.
+Три стадии:
+
+| Пакет (LE байты)    | Назначение                              |
+|---------------------|-----------------------------------------|
+| `26 00 00 20 ......`| Init download (размер в `param_4`)      |
+| `26 01 ss ss ......`| Chunk (`0x1F8` байт каждый)             |
+| `26 02 ss ss ......`| Wait DONE, error code в `reply[2]`      |
+
+Для eMMC **не используется** (eMMC algorithms хранятся на плате
+программатора и выбираются opcode `0x21`).
+
 ---

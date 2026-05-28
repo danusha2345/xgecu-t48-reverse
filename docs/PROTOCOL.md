@@ -727,3 +727,123 @@ FUN_00492900(handle, /*sub_op=*/0x48, /*length=*/0x200, /*arg=*/0, recv_buf);
 This is likely a **triple-read for verification** (compare three copies of
 EXT_CSD; if they all match the reader is happy). It's a defensive practice
 on noisy long lines, common in production-grade eMMC tooling.
+
+### 19.10 Reply layouts for init opcodes
+
+The same `read_ECSD` function unambiguously decodes the bytes returned for
+each of the three init opcodes. The reply buffer is read at fixed offsets:
+
+```
+8-byte reply to opcode 0x21 (INIT_EMMC)
+──────────────────────────────────────
+offset 1   :  byte  status   (0 = success)
+offset 4..8:  u32   OCR register   (JEDEC eMMC, raw)
+              bit 30 = high-capacity flag, bits [23:8] should be 0xFF8080 for 1.8 V
+
+32-byte reply to opcode 0x05 (READID for CID)
+─────────────────────────────────────────────
+offset 1   :  byte  status (0 = OK)
+offset 2..4:  u16   ?
+offset 4..8:  u32   ?
+offset 8..0x18: 16 bytes = CID register (JEDEC eMMC, 128-bit unique ID)
+
+24-byte reply to opcode 0x06 (READ_USER for CSD)
+────────────────────────────────────────────────
+offset 1     :  byte  status (0 = OK)
+offset 8..0x18: 16 bytes = CSD register (JEDEC eMMC, 128-bit Card-Specific Data)
+```
+
+Both CID and CSD are copied into the global buffer `DAT_007a4034`:
+CID at offset 0, CSD at offset 0x10. Higher-level code reads from these
+offsets directly. For chip-types other than eMMC the bytes are stored
+in reverse byte order, but for eMMC (chip_type 7) they go in verbatim.
+
+### 19.11 `FUN_004dbd50` — bulk-read for eMMC, full body
+
+```c
+void bulk_read_emmc(handle, buf, size) {
+    int slot = handle_to_slot(handle);
+    char chip_type = chip_type_table[slot * 0xEC];
+
+    if (chip_type == 6) {                 // NAND
+        raw_recv(handle, buf, size);              // EP1 IN
+        return;
+    }
+    if (chip_type == 7 || chip_type == 8) {       // eMMC or VGA
+        WinUsb_ReadPipe(handle, /*pipe=*/0x82, buf, size, ...);   // EP2 IN
+        return;
+    }
+    // Other chip types — possibly split into parallel reads:
+    if (size >= 0x41) {
+        size /= 2;
+        WinUsb_ReadPipe(handle, /*pipe=*/0x82, buf,         size, ...);   // EP2 IN
+        WinUsb_ReadPipe(handle, /*pipe=*/0x83, buf + size,  size, ...);   // EP3 IN (!)
+        WaitForSingleObject(event, 5000);
+    } else {
+        WinUsb_ReadPipe(handle, /*pipe=*/0x82, buf, size, ...);           // EP2 IN
+    }
+}
+```
+
+So **eMMC bulk reads always come back on EP2 IN (pipe 0x82)**, and for
+non-eMMC big reads Xgpro can stripe across EP2 IN + EP3 IN in parallel.
+
+### 19.12 `FUN_004dbd00` — *not* a "set timeout"; it's `WinUsb_SetPipePolicy`
+
+```c
+int set_pipe_policies(handle, ULONG timeout_ms /* stack arg */) {
+    WinUsb_SetPipePolicy(handle, 0x81, /*PIPE_TRANSFER_TIMEOUT=*/3, 4, &timeout_ms);
+    WinUsb_SetPipePolicy(handle, 0x82, 3, 4, &timeout_ms);
+    WinUsb_SetPipePolicy(handle, 0x83, 3, 4, &timeout_ms);
+    return 1;
+}
+```
+
+Sets the per-pipe transfer timeout on all three IN pipes (`0x81/0x82/0x83`).
+Confirms that EP3 IN really exists in the device descriptor.
+
+### 19.13 `BEGIN_TRANSACTION` (top-opcode `0x03`) is *not* used for eMMC
+
+The high-level eMMC dispatcher `FUN_004c9110` (≈ 1700 decompiled lines)
+contains **four calls to `FUN_004af370` (the init sub-step) and only one
+raw `FUN_004dc380` call** — no top-opcode `0x03` anywhere in the eMMC
+read/write/RPMB flows. This means:
+
+- **For eMMC, our own software does *not* need to send a 64-byte
+  `BEGIN_TRANSACTION` packet at all.**
+- The role that `BEGIN_TRANSACTION` plays for classic chips (selecting the
+  per-chip algorithm and configuring voltages) is fulfilled in eMMC by
+  **opcode `0x21`** plus the 1-byte parameter loaded from `DAT_007485d0`
+  (which Xgpro sets earlier based on the user's `variant` choice).
+- Practical consequence: the start-up sequence in the prototype simplifies
+  to `connect()` → opcode `0x21` (+ param) → opcode `0x05` → opcode `0x06`
+  → CMD6 SWITCH HS-200, with no `BEGIN_TRANSACTION` step.
+
+### 19.14 Full endpoint map (post-Ghidra)
+
+| Pipe ID | Direction | Role                                                   |
+|---------|-----------|--------------------------------------------------------|
+| `0x01`  | EP1 OUT   | All commands; combined 528-byte transfer for non-eMMC  |
+| `0x02`  | EP2 OUT   | Bulk-write payload for eMMC                            |
+| `0x03`  | EP3 OUT   | Parallel half of large non-eMMC writes                 |
+| `0x05`  | EP5 OUT   | VGA-only bulk-write                                    |
+| `0x81`  | EP1 IN    | All short responses (8/24/32 bytes)                    |
+| `0x82`  | EP2 IN    | Format B responses for eMMC; bulk-read for eMMC + VGA  |
+| `0x83`  | EP3 IN    | Parallel half of large non-eMMC reads                  |
+
+For the eMMC ISP path only `EP1 OUT/IN` and `EP2 OUT/IN` are needed.
+
+### 19.15 New top-opcode `0x26` — FPGA bitstream download
+
+`FUN_004bb4d0` (`download_algo`) implements an FPGA bitstream upload
+protocol used by the **VGA** path (chip_type 8), and possibly by other
+"download from PC" cases. The packet structure is three sub-stages:
+
+| Packet (LE bytes)   | Meaning                          |
+|---------------------|----------------------------------|
+| `26 00 00 20 ......` | Init download (size in `param_4`)|
+| `26 01 ss ss ......` | Stream chunk (`0x1F8` bytes each)|
+| `26 02 ss ss ......` | Wait for DONE flag, get error code in reply byte 2 |
+
+This opcode is **not** used by the eMMC paths (eMMC algorithms are stored
+on the programmer board and selected with opcode `0x21`).
