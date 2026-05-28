@@ -483,3 +483,132 @@ BOOT2 last page : буфер 0x30000-0x33FFF (16 КБ), устройство 0x1
 - Если в USB-обмене обнаружится pass-through aуть-байтов — это просто релэй (без знания ключа).
 
 ---
+
+## 19. Уточнения от Ghidra-декомпиляции
+
+После импорта `Xgpro.exe` в Ghidra 12 и декомпиляции ключевых wrapper'ов
+(которые в предыдущих разделах были выведены косвенно из ассемблера через
+capstone) получены ТОЧНЫЕ подтверждения и важные уточнения.
+
+### 19.1 `sub_4dc380` (raw EP1 send)
+
+```c
+void raw_send(handle, buf, len) {
+    WinUsb_WritePipe(handle, /*PipeID=*/1, buf, len, &transferred, NULL);
+}
+```
+Всегда pipe 1. Подтверждает `EP1_OUT = 0x01`.
+
+### 19.2 `sub_4dc300` (raw EP1 recv)
+
+```c
+int raw_recv(handle, buf, len) {
+    int chip_type = chip_type_table[slot * 0xEC];
+    int actual_len = (chip_type == 6) ? len + 1 : len;   // NAND нужен +1 байт
+    WinUsb_ReadPipe(handle, /*PipeID=*/0x81, buf, actual_len, ...);
+}
+```
+Всегда pipe 0x81 (EP1 IN). Для NAND host запрашивает `len + 1` байт.
+
+### 19.3 Format A — `FUN_00492f30` (top-opcode `0x27`)
+
+Пакет 8 байт `[0x27][sub_op][u16 = 0][u32 arg LE]`. Send EP1 OUT, recv 8 байт
+EP1 IN. Если `reply[1] != 0` → success.
+
+### 19.4 Format B — `FUN_00492900` (top-opcode `0x08`) — **EP2 IN для eMMC!**
+
+```c
+void cmd_B(handle, byte sub_op, ushort length, dword arg, char* reply) {
+    uint8_t pkt[8] = {0x08, sub_op, length&0xFF, length>>8, arg LE};
+    raw_send(handle, pkt, 8);                                    // EP1 OUT
+    int chip_type = ...;
+    if (chip_type == 7 || chip_type == 8)
+        WinUsb_ReadPipe(handle, 0x82, reply, length + 8, ...);   // EP2 IN!
+    else
+        raw_recv(handle, reply, length + 8);                     // EP1 IN
+}
+```
+
+**Критическая поправка:** для eMMC ответ на Format B приходит на **EP2 IN
+(pipe 0x82)**, а не на EP1 IN. Полный размер ответа = `length + 8`. Наш
+Python-прототип `read_ecsd()` обновлён соответственно.
+
+### 19.5 Format C — `FUN_00492670` (bulk-write eMMC) — **EP2 OUT**
+
+16-байтный setup на EP1: `[0x14, sub_op, 0, 0, 0, 0, 0, 0, count_lo, count_hi, 0x00, 0x02, 0, 0, 0, 0]`.
+
+Затем payload 512×count байт. ПО chip_type:
+- chip_type == 7 (eMMC): `WinUsb_WritePipe(handle, /*pipe=*/2, payload, count*512)` — EP2 OUT
+- chip_type == 8 (VGA): `WinUsb_WritePipe(handle, /*pipe=*/5, payload, count*512)` — **EP5 OUT (!)**
+- иначе: 16 + 512 = 528 байт одним пакетом на EP1 OUT
+
+Внутри 512-байт payload — JEDEC-RPMB трейлер в последних 12 байтах +
+опциональные nonce и 32-байт ключ из таблицы `DAT_0079A690` или
+`DAT_007C8048` (две RPMB-таблицы, выбор по `param_10`).
+
+### 19.6 Format D — `FUN_00492590` (bulk-read setup)
+
+```c
+pkt = [0x02000015 LE, 0, count_lo, count_hi, 0x00 0x02, 0, 0, 0, 0]   // 16 байт
+raw_send(handle, pkt, 16);
+if (chip_type == 7 || chip_type == 8)
+    FUN_004dbd50(handle, recv_buf, count * 512 + 16);   // ← отдельная функция
+else
+    raw_recv(handle, recv_buf, count * 512 + 16);       // EP1 IN
+```
+
+Для eMMC bulk-read идёт через **отдельную функцию `FUN_004dbd50`** —
+скорее всего, она читает с EP2 IN (по аналогии с Format B). Точно
+выяснить — следующий шаг декомпиляции.
+
+### 19.7 `composite_EP1` — `FUN_004dc070` (мульти-пайповые транзакции)
+
+Wrapper для передач, не вмещающихся на один endpoint. По chip_type:
+
+- chip_type 6 (NAND): EP1 setup + EP1 data (split)
+- chip_type 7 (eMMC): EP1 setup + **EP2 OUT** data
+- большие передачи: EP1 + **EP2 + EP3 OUT** параллельно (async через
+  `CreateEventA` + `WaitForSingleObject`)
+
+То есть Xgpro **может полосовать (stripe)** один логический command на
+EP1+EP2+EP3 одновременно для больших payload'ов. Не критично для нашего
+eMMC ISP пути, но знание полезно.
+
+### 19.8 eMMC init (`FUN_004af370`) — точные raw-пакеты
+
+```c
+// Шаг 1 — top-opcode 0x21:
+buf[0] = 0x21;
+buf[1] = DAT_007485d0;        // 1-байт параметр
+raw_send(handle, buf, 8);
+raw_recv(handle, reply, 8);
+
+// Шаг 2 — top-opcode 0x05 (READID):
+buf[0] = 0x05;
+*(u16*)&buf[2] = DAT_007a39cc;
+*(u32*)&buf[4] = 0;
+raw_send(handle, buf, 8);
+raw_recv(handle, reply, 0x20);  // 32 байта  ← chip ID / OCR / CID
+
+// Шаг 3 — top-opcode 0x06 (READ_USER):
+buf[0] = 6;
+raw_send(handle, buf, 8);
+raw_recv(handle, reply, 0x18);  // 24 байта  ← config / CSD
+```
+
+Success-проверка везде: `reply[1] != 0`.
+
+### 19.9 Чтение EXT_CSD (`FUN_004a1130`) — полный поток
+
+Функция Read ECSD делает **три подряд** Format B вызова с одинаковыми
+параметрами:
+
+```c
+FUN_00492900(handle, 0x48, 0x200, 0, recv_buf);   // x3
+```
+
+Это, видимо, **тройное чтение для верификации** (сравнить три копии
+EXT_CSD; если совпадают — данные надёжные). Стандартная защитная
+практика для длинных ISP-линий.
+
+---

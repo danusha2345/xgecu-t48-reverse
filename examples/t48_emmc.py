@@ -34,12 +34,15 @@ except ImportError:
 VID = 0xA466
 PID = 0x0A53
 
-# Endpoint pipe IDs, recovered from the disassembly of the raw send/recv
-# helpers sub_4dc380 / sub_4dc300 in Xgpro.exe:
-EP1_OUT = 0x01    # commands + bulk-write setup
-EP1_IN  = 0x81    # responses + bulk-read data (16-byte header + N*512 B)
-EP2_OUT = 0x02    # bulk-write payload (RPMB frames / CMD25 data)
-# EP2 IN is not observed in Xgpro's eMMC paths.
+# Endpoint pipe IDs, recovered from Ghidra-decompiled raw helpers in Xgpro.exe.
+# After full decompilation we discovered Xgpro uses up to FIVE pipes for some
+# transfers; for eMMC we only care about EP1 (bidirectional) and EP2 OUT/IN:
+EP1_OUT = 0x01    # short commands, bulk-read setup (sub_4dc380 always uses pipe 1)
+EP1_IN  = 0x81    # short responses (sub_4dc300 always uses pipe 0x81)
+EP2_OUT = 0x02    # bulk-write payload for eMMC (RPMB frames / CMD25 data)
+EP2_IN  = 0x82    # bulk-read responses for eMMC and VGA (Format B and some D paths!)
+# EP3 OUT (pipe 3) and EP5 OUT (pipe 5) also exist for parallel-transfer and
+# VGA paths respectively — not relevant for the eMMC ISP flow we care about.
 
 
 # ============================================================
@@ -241,13 +244,16 @@ class T48Emmc:
             except Exception: pass
             self.dev = None
 
-    # ---- raw EP1 ----
+    # ---- raw EP1 / EP2 ----
     def ep1_send(self, data: bytes) -> int:
         return self.dev.write(EP1_OUT, data, timeout=self.read_timeout_ms)
     def ep1_recv(self, n: int) -> bytes:
         return bytes(self.dev.read(EP1_IN, n, timeout=self.read_timeout_ms))
     def ep2_send(self, data: bytes) -> int:
         return self.dev.write(EP2_OUT, data, timeout=self.read_timeout_ms)
+    def ep2_recv(self, n: int) -> bytes:
+        # Used for Format B (top-opcode 0x08) responses in eMMC mode.
+        return bytes(self.dev.read(EP2_IN, n, timeout=self.read_timeout_ms))
 
     # ---- control commands ----
     def switch_partition(self, partition_access: int) -> bytes:
@@ -269,11 +275,14 @@ class T48Emmc:
         return self.ep1_recv(8)
 
     def read_ecsd(self) -> bytes:
-        """CMD8 SEND_EXT_CSD — read the 512-byte EXT_CSD."""
+        """CMD8 SEND_EXT_CSD — read the 512-byte EXT_CSD.
+
+        Ghidra-confirmed in 0x492900 (cmd_wrapper_0x08): for eMMC (chip_type==7)
+        the reply comes back on EP2 IN, with size = length + 8 (the trailing
+        8 bytes are a status/header footer that the wrapper does not strip).
+        """
         self.ep1_send(pack_cmd_B(LongRecvSubOp.READ_BLOCK_512, 0x200, 0))
-        # TODO: confirm whether 512 bytes arrive directly on EP1 IN,
-        # or 512 + a small header that needs stripping.
-        return self.ep1_recv(0x200)
+        return self.ep2_recv(0x200 + 8)
 
     def set_block_count(self, n: int) -> bytes:
         """CMD23 SET_BLOCK_COUNT."""

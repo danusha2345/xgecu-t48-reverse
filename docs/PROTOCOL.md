@@ -505,7 +505,225 @@ round-trips every file)<br>
 ✅ eMMC sub-opcode list extracted, 6 of 7 mapped to JEDEC semantics<br>
 ✅ CMD6 SWITCH argument encoding fully decoded<br>
 ✅ RPMB frame layout (Format C internals) fully decoded<br>
+✅ Ghidra-verified wire-format of all four packet formats (§19 below)<br>
 ⏳ Final byte-level validation of every opcode (needs a USB capture
    from a real T48)<br>
-⏳ The 16-byte setup payload for Format D (inferred, not yet directly
-   verified)<br>
+
+---
+
+## 19. Ghidra-verified wire formats
+
+After importing `Xgpro.exe` into Ghidra 12 and decompiling the key wrappers
+the previous sections had inferred from capstone-level assembly, the following
+details are now confirmed verbatim from the C-like decompilation. Numbers
+in parentheses are Ghidra's auto-named function symbols (e.g. `FUN_004dc380`).
+
+### 19.1 `sub_4dc380` (raw EP1 send) — `FUN_004dc380`
+
+```c
+void raw_send(handle, buf, len) {
+    WinUsb_WritePipe(handle, /*PipeID=*/1, buf, len, &transferred, NULL);
+}
+```
+
+Always pipe 1. Confirms our `EP1_OUT = 0x01`.
+
+### 19.2 `sub_4dc300` (raw EP1 recv) — `FUN_004dc300`
+
+```c
+int raw_recv(handle, buf, len) {
+    int slot = handle_to_slot(handle);      // 4 handles supported
+    int chip_type = chip_type_table[slot * 0xEC];
+    int actual_len = len;
+    if (chip_type == 6)        // NAND
+        actual_len = len + 1;  // NAND needs an extra byte
+    int rc = WinUsb_ReadPipe(handle, /*PipeID=*/0x81, buf, actual_len, ...);
+    return rc ? transferred : -1;
+}
+```
+
+Always pipe 0x81 (EP1 IN). For NAND the host requests `len + 1` bytes.
+
+### 19.3 Format A — `FUN_00492f30` (top-opcode `0x27`)
+
+```c
+void cmd_A(handle, byte sub_op, dword arg, char* reply_buf) {
+    uint8_t pkt[8];
+    pkt[0] = 0x27;
+    pkt[1] = sub_op;
+    *(u16*)&pkt[2] = 0;
+    *(u32*)&pkt[4] = arg;
+    if (raw_send(handle, pkt, 8) != 0) {            // EP1 OUT
+        if (raw_recv(handle, reply_buf, 8) != -1) { // EP1 IN, 8 bytes
+            if (reply_buf[1] != 0) { /* success */ }
+        }
+    }
+}
+```
+
+Confirmed: 8-byte command, 8-byte reply on EP1 IN. `reply_buf[1] != 0`
+appears to be the success indicator.
+
+### 19.4 Format B — `FUN_00492900` (top-opcode `0x08`) — **EP2 IN for eMMC**
+
+```c
+void cmd_B(handle, byte sub_op, ushort length, dword arg, char* reply_buf) {
+    uint8_t pkt[8];
+    pkt[0] = 0x08;
+    pkt[1] = sub_op;
+    *(u16*)&pkt[2] = length;
+    *(u32*)&pkt[4] = arg;
+    if (raw_send(handle, pkt, 8) != 0) {                    // EP1 OUT
+        int slot = handle_to_slot(handle);
+        int chip_type = chip_type_table[slot * 0xEC];
+        if (chip_type != 7 && chip_type != 8) {             // not eMMC, not VGA
+            raw_recv(handle, reply_buf, length + 8);        // EP1 IN
+        } else {
+            WinUsb_ReadPipe(handle, /*PipeID=*/0x82,        // EP2 IN!
+                            reply_buf, length + 8, ...);
+        }
+    }
+}
+```
+
+**Critical correction**: for eMMC the Format B response arrives on **EP2 IN
+(pipe 0x82)**, *not* EP1 IN. The total reply size is `length + 8`. Our
+Python prototype has been updated accordingly.
+
+### 19.5 Format C — `FUN_00492670` (bulk-write to eMMC) — **EP2 OUT**
+
+The 16-byte EP1 setup packet is:
+
+```c
+struct {
+    uint8_t  top_op;       // = 0x14
+    uint8_t  sub_op;       // = param_8
+    uint16_t pad;          // = 0
+    uint32_t pad2;         // = 0
+    uint16_t count;        // = param_6 (number of 512-byte sectors)
+    uint16_t block_size;   // = 0x0200
+    uint16_t pad3;         // = 0
+};
+```
+
+The 512-byte payload buffer (passed in `param_2`) is patched in-place to embed
+the **JEDEC-RPMB-style trailer** in its last 12 bytes plus optional 32-byte key
+and 16-byte nonce:
+
+| Offset | Size | Field             | Value                          |
+|--------|------|-------------------|--------------------------------|
+| `0x0C4..0x0E4` | 32 | Key/MAC      | from table `DAT_0079A690` (param_10=1) or `DAT_007C8048` (param_10=2) |
+| `0x1E4..0x1F4` | 16 | Nonce        | `rand()` × 16 if `param_9 != 0`  |
+| `0x1F4..0x1F8` | 4 BE | Write counter | `param_4` big-endian             |
+| `0x1F8..0x1FA` | 2 | param_3       | byte 0x1F9 = lo, byte 0x1F8 = hi |
+| `0x1FA..0x1FC` | 2 | param_5       | byte 0x1FB = lo, byte 0x1FA = hi |
+| `0x1FC..0x1FE` | 2 | zero          | 0                                |
+| `0x1FE..0x200` | 2 | param_7       | byte 0x1FF = lo, byte 0x1FE = hi |
+
+Transmission per chip-type:
+
+```c
+if (chip_type == 7) {            // eMMC
+    raw_send(handle, &setup, 16);                                          // EP1 OUT
+    WinUsb_WritePipe(handle, /*pipe=*/2, payload, count * 512, ...);       // EP2 OUT
+}
+else if (chip_type == 8) {       // VGA
+    raw_send(handle, &setup, 16);                                          // EP1 OUT
+    WinUsb_WritePipe(handle, /*pipe=*/5, payload, count * 512, ...);       // EP5 OUT (!)
+}
+else {
+    // Combined 16-byte setup + 512-byte payload sent together on EP1:
+    raw_send(handle, /*pointer*/, 0x210);   // = 528 bytes on EP1 OUT
+}
+```
+
+### 19.6 Format D — `FUN_00492590` (bulk-read setup)
+
+```c
+void bulk_read_setup(handle, void* recv_buf, ushort count) {
+    uint8_t pkt[16];
+    *(u32*)&pkt[0] = 0x02000015;     // magic / top-opcode + sub-byte
+    *(u32*)&pkt[4] = 0;
+    *(u16*)&pkt[8] = count;
+    *(u16*)&pkt[10] = 0x0200;
+    *(u16*)&pkt[12] = 0;
+    *(u16*)&pkt[14] = 0;
+    if (raw_send(handle, pkt, 16) != 0) {                                  // EP1 OUT
+        int chip_type = ...;
+        if (chip_type == 7 || chip_type == 8)                              // eMMC / VGA
+            FUN_004dbd50(handle, recv_buf, count * 512 + 16);              // (TBD endpoint)
+        else
+            raw_recv(handle, recv_buf, count * 512 + 16);                  // EP1 IN
+    }
+}
+```
+
+For eMMC bulk reads the wrapper calls a *separate* helper `FUN_004dbd50` —
+this one likely reads from a different pipe (EP2 IN is the natural candidate,
+given the Format B precedent). Decompiling `FUN_004dbd50` is the next step.
+
+### 19.7 `composite_EP1` — `FUN_004dc070` (multi-pipe transactions)
+
+This wrapper handles transfers that don't fit a single endpoint. Per chip-type:
+
+```c
+if (chip_type == 6) {                  // NAND
+    WinUsb_WritePipe(handle, 1, buf,     8,         ...);
+    WinUsb_WritePipe(handle, 1, buf + 8, len - 7,   ...);   // split on EP1
+}
+else if (chip_type == 7) {             // eMMC
+    WinUsb_WritePipe(handle, 1, buf,     8,         ...);   // setup on EP1
+    WinUsb_WritePipe(handle, 2, buf + 8, len - 8,   ...);   // payload on EP2
+}
+else if (len > 0x40) {                 // large transfer, asynchronous
+    // Setup + two parallel payloads using OVERLAPPED + WaitForSingleObject:
+    WinUsb_WritePipe(handle, 1, buf,         8,           ...);
+    WinUsb_WritePipe(handle, 2, buf + 8,     half_a,      ...);   // EP2
+    WinUsb_WritePipe(handle, 3, buf + 8 + a, half_b,      ...);   // EP3 (!)
+}
+```
+
+So Xgpro can stripe one logical command across **EP1 / EP2 / EP3 simultaneously**
+for big payloads; the host waits on `WaitForSingleObject` for both EP2 and EP3
+to drain. Not relevant for the eMMC ISP path we target, but worth knowing.
+
+### 19.8 eMMC init (`FUN_004af370`) — exact raw packets
+
+```c
+// Step 1 — top-opcode 0x21:
+buf[0] = 0x21;
+buf[1] = DAT_007485d0;        // 1-byte parameter (set at config time)
+raw_send(handle, buf, 8);
+raw_recv(handle, reply, 8);
+
+// Step 2 — top-opcode 0x05 (READID):
+buf[0] = 0x05;
+*(u16*)&buf[2] = DAT_007a39cc; // 2-byte parameter
+*(u32*)&buf[4] = 0;
+raw_send(handle, buf, 8);
+raw_recv(handle, reply, 0x20);  // 32 bytes  ← chip ID / OCR / CID payload
+
+// Step 3 — top-opcode 0x06 (READ_USER):
+buf[0] = 6;
+raw_send(handle, buf, 8);
+raw_recv(handle, reply, 0x18);  // 24 bytes  ← config / CSD payload
+```
+
+The bytes of the reply at offset 0..1 carry a status code: the function
+takes the success branch when `reply[1] != 0`, which matches the Format A
+success convention.
+
+### 19.9 Read EXT_CSD (`FUN_004a1130`) — full flow
+
+The user-facing "Read ECSD" code (entry at `FUN_004a1130`) issues **three
+back-to-back** Format B reads, all with the same parameters:
+
+```c
+FUN_00492900(handle, /*sub_op=*/0x48, /*length=*/0x200, /*arg=*/0, recv_buf);
+FUN_00492900(handle, /*sub_op=*/0x48, /*length=*/0x200, /*arg=*/0, recv_buf);
+FUN_00492900(handle, /*sub_op=*/0x48, /*length=*/0x200, /*arg=*/0, recv_buf);
+```
+
+This is likely a **triple-read for verification** (compare three copies of
+EXT_CSD; if they all match the reader is happy). It's a defensive practice
+on noisy long lines, common in production-grade eMMC tooling.
