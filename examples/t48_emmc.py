@@ -291,12 +291,104 @@ def build_rpmb_frame(req: int, address: int, block_count: int, write_counter: in
 
 
 # ============================================================
+# BEGIN_TRANSACTION (top-opcode 0x03) — 64-byte session-init packet
+# ============================================================
+# A real eMMC record straight out of emmc_chips_t48.json (entry #0). This is
+# the auto-detect 4-bit ISP card profile — the most likely first target once
+# the eMMC-ISP adapter is on hand.  variant=0x4400: high byte 'D'(0x44)=ISP
+# 4-bit, low byte 0x00=1.8V default (see VARIANT_LETTER and PROTOCOL §20.3).
+EMMC_AUTO_4BIT_ISP = {
+    "name":              "AUTO-SD/TF_CARD(4Bits) @SD_ADP",
+    "protocol_id":       0x31,    # 49 — IC2_ALG_EMMC
+    "variant":           0x4400,
+    "code_memory_size":  512,
+    "data_memory_size":  32,
+    "data_memory2_size": 0,
+}
+
+
+def build_begin_transaction(rec: dict) -> bytes:
+    """
+    Assemble the 64-byte BEGIN_TRANSACTION (top-opcode 0x03) for an eMMC chip
+    from one database record (an entry of emmc_chips_t48.json).
+
+    Layout follows the verified r2 trace of FUN_00444bc0 (PROTOCOL.md §30,
+    which corrects the earlier §20.2 table).  Only the fields that live in the
+    *per-chip* record AND have a stable offset are filled here:
+
+        confirmed from DB record (single store, no chip_type branch)
+        ------------------------------------------------------------
+        0x00      0x03                       top-opcode BEGIN_TRANS
+        0x01      protocol_id (0x31)         eMMC                  (DAT_007a3978)
+        0x02      variant & 0xFF             variant low byte      (DAT_007a39a8)
+        0x08..0a  data_memory_size  (u16)    (DAT_007a39ac — stored ONCE, at 0x08)
+        0x0a..0c  data_memory2_size (u16)    (DAT_007a39c0)
+        0x10..14  code_memory_size  (u32)    (DAT_007a397c)
+
+        NOT in our simplified record / not DB-only — left zero, confirm by capture
+        -------------------------------------------------------------------------
+        0x03..08        pin/cfg bytes        (DAT_007a39bc/bd/b4/397b — per chip)
+        0x0c..10        page_size, pulse_delay
+        0x14            DAT_007a3979 byte    (per-chip DB byte, not in our record)
+        0x15..17        VOLTAGE/cfg          (for eMMC: 0x15 = VCCQ UI global
+                                              DAT_007485c8, 0x16 = 0; 0x17 unwritten)
+        0x18..3f        UI/mode globals      (DAT_00904exx etc. — UI state, not DB)
+
+    Two correctness notes from the trace (§30):
+      * data_memory_size is NOT duplicated at 0x04 (the old §20.2 "dup" was a
+        phantom — 0x04 is a per-chip cfg byte we don't model).
+      * The eMMC voltage byte at 0x15 comes from the UI VCCQ selection
+        (DAT_007485c8), so it is NOT derivable from the per-chip record alone —
+        this is exactly the "voltage byte order is one capture away" TBD (§28.4).
+
+    So the returned packet is a *correct skeleton*, not a byte-exact replay.
+    Diff it against the real BEGIN_TRANSACTION in the first capture (with the
+    adapter present) to fill 0x03..08 and 0x14..3f.
+    """
+    pkt = bytearray(64)
+    pkt[0x00] = 0x03
+    pkt[0x01] = rec.get("protocol_id", 0x31) & 0xFF        # eMMC
+    pkt[0x02] = rec.get("variant", 0) & 0xFF               # variant low byte
+    struct.pack_into('<H', pkt, 0x08, rec.get("data_memory_size", 0) & 0xFFFF)
+    struct.pack_into('<H', pkt, 0x0a, rec.get("data_memory2_size", 0) & 0xFFFF)
+    struct.pack_into('<I', pkt, 0x10, rec.get("code_memory_size", 0) & 0xFFFFFFFF)
+    return bytes(pkt)
+
+
+def load_db_record(name: str,
+                   path: str = "../../xgecu_программа/emmc_chips_t48.json") -> Optional[dict]:
+    """
+    Convenience: pull one record by exact `name` from the (gitignored, never
+    committed) dumped chip database.  Returns None if the file isn't present
+    or the name isn't found.  For committed/offline use, prefer the inlined
+    EMMC_AUTO_4BIT_ISP record above.
+    """
+    import json, os
+    here = os.path.dirname(os.path.abspath(__file__))
+    full = path if os.path.isabs(path) else os.path.join(here, path)
+    if not os.path.exists(full):
+        return None
+    with open(full, encoding="utf-8") as f:
+        db = json.load(f)
+    for rec in db:
+        if rec.get("name") == name:
+            return rec
+    return None
+
+
+# ============================================================
 # High-level eMMC operations (drafts)
 # ============================================================
 class T48Emmc:
-    def __init__(self):
+    def __init__(self, log_path: Optional[str] = None):
         self.dev = None
         self.read_timeout_ms = 5000
+        # Optional ground-truth log: every USB transfer (direction, endpoint,
+        # length, hexdump) is appended here.  This is the single most useful
+        # thing to enable on the first real session — every "TODO: confirm
+        # with USB capture" in this file is answered by diffing this log.
+        self._log_fh = open(log_path, "a", buffering=1) if log_path else None
+        self._xfer_no = 0
 
     def connect(self) -> None:
         self.dev = usb.core.find(idVendor=VID, idProduct=PID)
@@ -308,7 +400,15 @@ class T48Emmc:
                 self.dev.detach_kernel_driver(0)
         except Exception:
             pass
-        self.dev.set_configuration()
+        # Only configure if the device isn't already configured — an
+        # unconditional set_configuration() raises "Resource busy" on some
+        # Linux kernels when the device came up configured.
+        try:
+            already = self.dev.get_active_configuration() is not None
+        except usb.core.USBError:
+            already = False
+        if not already:
+            self.dev.set_configuration()
         usb.util.claim_interface(self.dev, 0)
         print(f"[+] T48 opened: {self.dev}")
 
@@ -316,18 +416,56 @@ class T48Emmc:
         if self.dev:
             try: usb.util.release_interface(self.dev, 0)
             except Exception: pass
+            try: usb.util.dispose_resources(self.dev)
+            except Exception: pass
             self.dev = None
+        if self._log_fh:
+            try: self._log_fh.close()
+            except Exception: pass
+            self._log_fh = None
+
+    # ---- transfer logging ----
+    @staticmethod
+    def _hex(data: bytes, max_bytes: int = 80) -> str:
+        """Greppable, diffable hexdump. Long transfers are truncated to the
+        first `max_bytes` (which always covers the 8/16-byte framing header
+        that the protocol decode cares about) plus a count of the remainder."""
+        b = bytes(data)
+        s = " ".join(f"{x:02x}" for x in b[:max_bytes])
+        if len(b) > max_bytes:
+            s += f" … (+{len(b) - max_bytes} more)"
+        return s
+
+    def _log(self, direction: str, ep: str, data: bytes,
+             requested: Optional[int] = None) -> None:
+        if not self._log_fh:
+            return
+        self._xfer_no += 1
+        ts = time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
+        n = len(data)
+        note = ""
+        if requested is not None and n != requested:
+            note = f" (req {requested}{', SHORT!' if n < requested else ''})"
+        self._log_fh.write(
+            f"{ts}  #{self._xfer_no:<4} {direction:<3} {ep:<4} "
+            f"len={n}{note}  {self._hex(data)}\n")
 
     # ---- raw EP1 / EP2 ----
     def ep1_send(self, data: bytes) -> int:
+        self._log("OUT", "EP1", data)
         return self.dev.write(EP1_OUT, data, timeout=self.read_timeout_ms)
     def ep1_recv(self, n: int) -> bytes:
-        return bytes(self.dev.read(EP1_IN, n, timeout=self.read_timeout_ms))
+        data = bytes(self.dev.read(EP1_IN, n, timeout=self.read_timeout_ms))
+        self._log("IN", "EP1", data, requested=n)
+        return data
     def ep2_send(self, data: bytes) -> int:
+        self._log("OUT", "EP2", data)
         return self.dev.write(EP2_OUT, data, timeout=self.read_timeout_ms)
     def ep2_recv(self, n: int) -> bytes:
         # Used for Format B (top-opcode 0x08) responses in eMMC mode.
-        return bytes(self.dev.read(EP2_IN, n, timeout=self.read_timeout_ms))
+        data = bytes(self.dev.read(EP2_IN, n, timeout=self.read_timeout_ms))
+        self._log("IN", "EP2", data, requested=n)
+        return data
 
     # ---- control commands ----
     def switch_partition(self, partition_access: int) -> bytes:
@@ -650,6 +788,19 @@ if __name__ == "__main__":
     hs200_arg = make_switch_arg(SwitchAccess.SET_BITS, Ecsd.HS_TIMING, 0x01)
     assert hs200_arg == 0x01AF0100, f"HS200 switch arg mismatch: 0x{hs200_arg:08x} vs 0x01AF0100"
     print("\n[OK] All three decoded commands match the bytes seen in Xgpro.exe.")
+
+    # BEGIN_TRANSACTION skeleton from a real DB record.
+    bt = build_begin_transaction(EMMC_AUTO_4BIT_ISP)
+    print("\n== BEGIN_TRANSACTION skeleton (AUTO 4-bit ISP) ==")
+    print(f"  {bt[:16].hex()}  …  ({len(bt)} bytes)")
+    assert len(bt) == 64
+    assert bt[0] == 0x03                       # top-opcode
+    assert bt[1] == 0x31                       # eMMC protocol_id
+    assert bt[2] == 0x00                       # variant low byte (0x4400 & 0xff)
+    assert struct.unpack_from('<H', bt, 0x08)[0] == 32     # data_memory_size (at 0x08)
+    assert struct.unpack_from('<I', bt, 0x10)[0] == 512    # code_memory_size
+    assert struct.unpack_from('<H', bt, 0x04)[0] == 0      # NOT a data_memory_size dup
+    print("  [OK] confirmed fields populated; 0x03..08 & 0x14..3f zero (capture-only).")
 
     # Optional device probe (requires a connected T48).
     if "--connect" in sys.argv:

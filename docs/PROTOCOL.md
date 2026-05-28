@@ -2074,3 +2074,110 @@ session is byte-for-byte the same shape as a BGA read.
 That removes another worry — our prototype's `bulk_read()` does not
 need an "ISP mode" flag; it can build the same Format C / Format D
 pair for any normal eMMC read regardless of how the chip is wired.
+
+---
+
+## 30. Fourth corrections pass — verified `BEGIN_TRANSACTION` byte map
+
+Before hardware arrival the `BEGIN_TRANSACTION` builder was generated
+from the inferred §20.2 table. A fresh **radare2 trace of the actual
+store instructions in `FUN_00444bc0`** (not the decompiler's inferred
+field list) corrected several offsets. This pass is static-only and
+should still be diffed against the first real capture, but it is now
+instruction-level rather than guessed.
+
+Reproduce with:
+```
+r2 -q -e bin.cache=true -e scr.color=0 -c 's 0x00444bc0; af; pdf' Xgpro.exe
+```
+
+### 30.1 The buffer and the two send paths
+
+- Command buffer base = `[ebp - 0x12018]` = `buf+0x00`.
+- There are **two** build/send paths, both sending `len = 0x40`:
+  - **Path A** (`chip_type == 0x2d` at the top branch `0x444c16`): builds
+    a *different* layout from the `0x0079a8xx` globals; `push 0x40` at
+    `0x444d22`, `call 0x4dc380` at `0x444d26`.
+  - **Path B** (everything else — the path §20.2 meant to describe):
+    `push 0x40` at `0x44501a`, `lea eax,[ebp-0x12018]` at `0x445029`,
+    `call 0x4dc380` at **`0x445031`**.
+- The 8-byte `REQUEST_STATUS` follow-up on Path B writes
+  `byte[buf]=0x39` then `call 0x4dc380` at `0x445079` (len 8), and reads
+  the 32-byte reply into `[ebp-0x24020]` via `call 0x4dc300` at
+  `0x445088`. (Note the read helper `0x4dc300` ≠ the write helper
+  `0x4dc380`.)
+
+### 30.2 Corrected Path-B byte map (instruction-verified)
+
+| Off | sz | default source | branch override |
+|----:|----|----------------|-----------------|
+| 0x00 | b | literal `0x03` | — |
+| 0x01 | b | `DAT_007a3978` (chip_type / protocol_id) | — |
+| 0x02 | b | `DAT_007a39a8` (variant low) | — |
+| 0x03 | b | `DAT_007a3ba6` | — |
+| 0x04 | b | `DAT_007a39bc` (cfg byte `dl`) | reworked into 0x15/0x16 in nibble paths |
+| 0x05 | b | `DAT_007a39bd` | overwritten in 0x31/0x2d/nibble paths |
+| 0x06 | b | `DAT_007a39b4` (pin_map) | — |
+| 0x07 | b | `DAT_007a397b` | — |
+| 0x08 | w | `DAT_007a39ac` (**data_memory_size — stored once**) | — |
+| 0x0a | w | `DAT_007a39c0` (data_memory2_size) | — |
+| 0x0c | w | `DAT_007a39c4` (page_size) | 0x31 path → `DAT_007a39a9` zext |
+| 0x0e | w | `DAT_007a39b0` (pulse_delay) | — |
+| 0x10 | dw | `DAT_007a397c` (code_memory_size) | — |
+| **0x14** | b | **`DAT_007a3979`** (unconditional) | — |
+| **0x15** | b | **(none by default)** | 0x31: ← `DAT_007485c8`; nibble path: `dl & 0x0F` |
+| **0x16** | b | **(none by default)** | 0x31: ← `0`; nibble path: `dl & 0xF0` |
+| **0x17** | b | **never written (leftover)** | — |
+| 0x18 | dw | `DAT_00904e88` | 0x31/0x2d/0x12/0x34 overwrite |
+| 0x1c | dw | `DAT_00904e8c` | 0x31/0x2d/0x34 overwrite |
+| 0x20 | dw | `DAT_00904e90` | 0x31/0x34 overwrite |
+| 0x24 | dw | `DAT_00904e94` | `if chip_type==5` → `DAT_0080187b` |
+| 0x28 | dw | `DAT_007a39d4` | 0x2d → `DAT_0079a8dc` |
+| 0x2c | dw | `DAT_007a39b6` (**u16 zero-extended**) | — |
+| 0x30 | dw | `DAT_007a39d0` (i32) | — |
+| 0x34 | w | `DAT_007a3ba4` | — |
+| 0x36 | w | `DAT_007a39be` (byte → word) | — |
+| 0x38 | dw | `DAT_007a39d8` | — |
+| 0x3c | b | literal `0` | 0x34 → `byte[esi+0x696588]` |
+| 0x3d | b | literal `0` | — |
+| 0x3e | b | **never written (leftover)** | — |
+| 0x3f | b | `DAT_007a39a9` | — |
+
+### 30.3 The `0x14..0x18` "voltage" region — resolved
+
+It is **not** a u32 voltage word. It is three independent bytes plus
+one uninitialised byte:
+
+- `0x14` = `DAT_007a3979` — a per-chip DB byte, written unconditionally.
+- `0x15` / `0x16` — written **only inside the `chip_type` branch ladder**:
+  - **eMMC (`chip_type == 0x31`):** `0x15 ← DAT_007485c8`, `0x16 ← 0`.
+    `DAT_007485c8` is a **UI/mode global** (the VCCQ selection), *not*
+    the per-chip record. So the eMMC VCCQ byte is **not derivable from
+    the chip-DB record alone** — it tracks the "VCC=3.0V VCCQ=1.8/3.0V"
+    UI choice (§20.3).
+  - **generic chips:** a nibble split of `DAT_007a39bc`
+    (`0x15 = dl&0x0F`, `0x16 = dl&0xF0`, with a `0xF0`-special case).
+- `0x17` is never written — leftover stack content.
+
+This is the long-standing "voltage byte order is one capture away"
+item (§28.4). Statically it is now pinned to *which* byte and *which*
+global; the only thing the capture still adds is the concrete value of
+`DAT_007485c8` for each of the three VCCQ UI settings.
+
+### 30.4 Corrections to the §20.2 table
+
+1. `data_memory_size` (`DAT_007a39ac`) is stored **once, at 0x08** — the
+   §20.2 "0x04..06 dup" was a phantom. `0x04` is `DAT_007a39bc` (cfg).
+2. `0x05` (`DAT_007a39bd`) was **missing** from §20.2.
+3. `0x2c` is a **u16 zero-extended**, not a native u32.
+4. The 0x30..38 block was mis-assigned: `DAT_007a39d0` (i32) is at
+   **0x30** (§20.2 said 0x34..38); `DAT_007a3ba4` is at **0x34**
+   (§20.2 said 0x30); `DAT_007a39be` (byte→word) is at **0x36**
+   (§20.2 said 0x32).
+5. `0x3c..3f` is **not** all padding: `0x3c=0`, `0x3d=0`,
+   `0x3e=leftover`, `0x3f=DAT_007a39a9`.
+
+The prototype's `build_begin_transaction()` was updated to match this
+map: it now fills only `0x00/0x01/0x02/0x08/0x0a/0x10` (the stable
+per-chip-DB fields) and leaves `0x03..08` and `0x14..3f` zero for the
+capture to fill.

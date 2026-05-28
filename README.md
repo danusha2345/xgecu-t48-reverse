@@ -36,7 +36,15 @@ small Python prototype that uses the same encoding.
   packets, and call them through high-level methods
   (`switch_partition`, `read_ecsd`, `bulk_read`, RPMB frame builder,
   etc.). Has an offline sanity test that verifies the three decoded
-  CMD6 SWITCH arguments match the bytes seen in `Xgpro.exe`.
+  CMD6 SWITCH arguments match the bytes seen in `Xgpro.exe`. Every USB
+  transfer can be logged to a file (`T48Emmc(log_path=…)`) so a real
+  session becomes ground truth for the protocol doc.
+- [`examples/first_contact.py`](examples/first_contact.py) — a
+  **zero-risk** first-session probe to run the moment a T48 is plugged
+  in: `connect → identify → measure voltages → status → read pins`. It
+  applies **no programming voltage**, needs **no chip** and **no
+  eMMC-ISP adapter**, and logs every transfer. The safe way to validate
+  the transport and the classic opcodes before touching a chip.
 - [`tools/extract_alg.py`](tools/extract_alg.py) — standalone unpacker
   for the proprietary `.alg` files that ship with `Xgpro`. Each `.alg`
   contains a zero-RLE-compressed Xilinx Spartan-6 FPGA bitstream
@@ -92,6 +100,13 @@ With a T48 plugged in, `python3 examples/t48_emmc.py --connect` will
 attempt to open the device via libusb. On Linux you may need a udev
 rule to grant your user access to the device interface; on Windows the
 official WinUSB driver from XGecu is fine.
+
+For the **first** run on a fresh device, prefer the safe probe — it
+applies no voltage, needs no chip, and saves a full transfer trace:
+
+```bash
+python3 examples/first_contact.py          # → t48_first_contact.log
+```
 
 ## Unpacking a `.alg` (optional)
 
