@@ -1,0 +1,63 @@
+# Claude / AI assistants
+CLAUDE.md
+.claude/
+.serena/
+.cursor/
+.cursorrules
+.aider*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Proprietary XGecu material — never commit even if copied locally
+*.alg
+*.bit
+Xgpro.exe
+InfoIC2Plus.dll
+UpdateT48.dat
+updateII.dat
+updateT56.dat
+Serial25Index.dat
+config.dat
+OtherCfg.dat
+language.dat
+UpdateT48.dat
+Logic.lst
+*.7z
+T48_user_Guide.pdf
+T48_*.pdf
+algorithm/
+xgecu/
+emmc_chips_t48.json
+
+# Build artifacts / outputs of the unpacker
+*.bit
+extracted/
+out/
+
+# Logs / scratch
+*.log
+*.tmp
+*.bak
+*.pcap
+*.pcapng
+scratch/
+notes_private/
