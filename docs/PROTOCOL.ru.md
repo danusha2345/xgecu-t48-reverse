@@ -1602,6 +1602,104 @@ test**: каждый counter отслеживает bit-flips на одной л
 Только эти три вещи реально нужно проверить дампом. Остальное —
 byte-for-byte задокументировано из бинаря.
 
+---
+
+## 29. Ещё поправки после перепроверки
+
+Финальный cross-check перед «всё закрыто» нашёл ещё две существенные
+ошибки + полезную truth-table для RPMB/CMD18 wrapper.
+
+### 29.1 `DAT_0080109b` — это **модель программатора**, не chip type
+
+Раньше я называл `DAT_0080109b` "chip type" — из-за сравнений типа
+`chip_type == 7` в `cmd_wrapper_0x08` и `bulk_read_emmc`. Но функция
+которая **устанавливает** этот байт (`FUN_00436e90`) показывает другое:
+
+```c
+if (mode == 0)  DAT_0080109b = 6;   // T56 demo
+if (mode == 1)  DAT_0080109b = 7;   // T48 demo
+if (mode == 2)  DAT_0080109b = 5;   // TL866II Plus demo
+// и == 8 для T76.
+```
+
+Значит этот байт — **идентификатор семейства программатора**:
+
+| Значение | Программатор      |
+|---------:|-------------------|
+| `5`      | TL866II Plus      |
+| `6`      | T56               |
+| `7`      | **T48** (TL866-3G) |
+| `8`      | T76               |
+
+Каждая проверка которую я считал «chip-side test» на самом деле —
+**programmer-family test**:
+
+| Прежнее чтение | Реальный смысл |
+|---|---|
+| Format B reply на EP2 IN "для eMMC" | EP2 IN routing на **T48/T76**; на T56 идёт EP1 IN |
+| Bulk reads на EP2 IN "для eMMC/VGA" | То же самое — T48/T76 routing |
+| `raw_recv` +1 байт "для NAND" | +1 байт **для T56** (model = 6), не связано с типом чипа |
+
+**Практически:** прототип всё равно корректен для T48 ISP — *каждое*
+условие "if chip_type 7 or 8" удовлетворяется тем, что мы на T48
+(model 7). Но при порте на T56 routing меняется.
+
+Оставляю имя `chip_type` в §19–§22 как есть (git history continuity),
+но **мысленно подставлять "programmer model"** при чтении констант
+`5 / 6 / 7 / 8`.
+
+### 29.2 Truth-table всех 7 callers `FUN_00492670`
+
+Семь call-сайтов Format C bulk write. С корректной индексацией
+push'ей (`pushes[-7]` = `req`, `pushes[-9]` = `gen_nonce`,
+`pushes[-10]` = `key_src`):
+
+| Сайт VA   | `count` | `req` | `nonce` | `key` | JEDEC RPMB         | Применение                                  |
+|-----------|--------:|------:|--------:|------:|--------------------|---------------------------------------------|
+| `0x49388a` | 1      | `5`   | (reg)   | (reg) | `READ_RESULT`      | после password/OTP write — read response    |
+| `0x49da64` | 1      | `4`   | `1`     | `0`   | `AUTH_DATA_READ`   | **BGA-mode CMD18 read** (1 сектор)          |
+| `0x4a9a64` | 1      | `4`   | `1`     | `0`   | `AUTH_DATA_READ`   | **ISP-mode CMD18 read** — *идентично* BGA   |
+| `0x4afd51` | 1      | `4`   | (reg)   | (reg) | `AUTH_DATA_READ`   | RPMB authenticated read                     |
+| `0x4afdd5` | 1      | `1`   | (reg)   | `2`   | `PROGRAM_KEY`      | **One-shot key programming, key table #2** |
+| `0x4afe07` | 1      | `5`   | (reg)   | (reg) | `READ_RESULT`      | после `PROGRAM_KEY` — read response         |
+| `0x4b041b` | 1      | `2`   | `1`     | (reg) | `READ_WC`          | Read write counter                          |
+
+Два важных наблюдения:
+
+1. **`gen_nonce = 1` НЕ ISP-специфика.** BGA CMD18 (0x49da64) ставит
+   точно так же как ISP (0x4a9a64). Nonce — часть **каждого** normal
+   CMD18 frame, не маркер ISP-mode. Моя §27.4 утверждала обратное —
+   это было неверно.
+
+2. **Точно один `PROGRAM_KEY` call site (0x4afdd5)**, и всегда с
+   `key_src = 2` (вторая hardcoded table `DAT_007C8048`). Если кто-то
+   воспроизводит RPMB flow по нашему коду — обязательно повесить
+   `PROGRAM_KEY` за явный opt-in пользователя: это one-shot per chip,
+   ошибка = RPMB-write навсегда заблокирован.
+
+### 29.3 ISP-read flow упрощается до BGA-эквивалента
+
+Вместе с §28.2 (`FUN_004fc156` = `CreateFile`, не partition switch),
+flow внутри `FUN_004a98f0` теперь:
+
+```c
+open_dump_file(host_path);            // FUN_004fc156 — просто файл
+while (block_count_left > 0) {
+    bulk_write_setup(/*req=*/4, /*gen_nonce=*/1, /*key=*/0);   // CMD18 setup
+    bulk_read_data(64 сектора = 32 КБ);
+    write_sectors_to_dump_file();
+    block_count_left -= …;
+}
+```
+
+**Никакой отдельной "ISP" обработки** в этой функции (кроме entry
+conditions по `variant` high byte — §27.1, остаётся). Сессия
+байт-в-байт повторяет BGA read.
+
+Это убирает ещё одно «но» — наш прототип `bulk_read()` не нуждается
+в "ISP mode" flag; та же Format C / Format D пара подходит для
+**любого** normal eMMC read независимо от как чип подключён.
+
 ### 24.1 Two-step «Program Key»
 
 ```

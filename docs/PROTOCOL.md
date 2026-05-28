@@ -1969,3 +1969,108 @@ After 28.1–28.3 the list of "uncertain" items is short:
 These are honestly the only three things the prototype needs the
 first USB capture to settle. Everything else is byte-for-byte
 documented from the binary.
+
+---
+
+## 29. More corrections after re-verification
+
+A final cross-check before declaring the static reverse "done" turned
+up two more meaningful errors plus a useful truth table for the
+RPMB / CMD18 wrapper.
+
+### 29.1 `DAT_0080109b` is **programmer model**, not chip type
+
+Throughout earlier sections I referred to `DAT_0080109b` as the
+"chip type" — picked up from comparisons like `chip_type == 7` in
+`cmd_wrapper_0x08` and `bulk_read_emmc`. The function that *sets*
+this byte (`FUN_00436e90`) tells a different story:
+
+```c
+if (mode == 0)  DAT_0080109b = 6;   // T56 demo
+if (mode == 1)  DAT_0080109b = 7;   // T48 demo
+if (mode == 2)  DAT_0080109b = 5;   // TL866II Plus demo
+// And reportedly == 8 for T76.
+```
+
+So the byte is the **programmer-family identifier**:
+
+| Value | Programmer        |
+|------:|-------------------|
+| `5`   | TL866II Plus      |
+| `6`   | T56               |
+| `7`   | **T48** (TL866-3G) |
+| `8`   | T76               |
+
+This means every check that *looked* like a chip-side test is
+actually a **programmer-family test**:
+
+| Earlier reading | Real meaning |
+|---|---|
+| Format B reply comes on EP2 IN "for eMMC" | EP2 IN routing happens **on T48 / T76**; on T56 it lands on EP1 IN |
+| Bulk reads go to EP2 IN "for eMMC / VGA" | Same — it's the T48/T76 routing |
+| `raw_recv` adds +1 byte "for NAND" | It adds +1 byte **for T56** (programmer = 6), unrelated to chip type |
+
+**Practically:** the existing prototype is still correct for T48 ISP
+work — *every* condition that used to be "if chip_type 7 or 8" is
+satisfied by us being on T48 (model 7). But if anyone ports this code
+to T56 the EP routing changes and they need to follow the `model == 6`
+branches instead.
+
+I am leaving `chip_type` named as-is in §19–§22 for git-history
+continuity, but every reader should mentally substitute
+**"programmer model"** whenever they see the comparison constants
+`5 / 6 / 7 / 8`.
+
+### 29.2 Truth table for all 7 callers of `FUN_00492670`
+
+There are exactly seven call sites of `FUN_00492670` (Format C bulk
+write) in `Xgpro.exe`. With pushed-arg indexing corrected
+(`pushes[-7]` is `req`, `pushes[-9]` is `gen_nonce`, `pushes[-10]`
+is `key_src`):
+
+| Site VA   | `count` | `req` | `gen_nonce` | `key_src` | JEDEC RPMB request | Use                                          |
+|-----------|--------:|------:|------------:|----------:|--------------------|----------------------------------------------|
+| `0x49388a` | 1      | `5`   | (reg)       | (reg)     | `READ_RESULT`      | after password / OTP write — read response   |
+| `0x49da64` | 1      | `4`   | `1`         | `0`       | `AUTH_DATA_READ`   | **BGA-mode CMD18 read** (1 sector)           |
+| `0x4a9a64` | 1      | `4`   | `1`         | `0`       | `AUTH_DATA_READ`   | **ISP-mode CMD18 read** — *identical* to BGA |
+| `0x4afd51` | 1      | `4`   | (reg)       | (reg)     | `AUTH_DATA_READ`   | RPMB-mode authenticated read                 |
+| `0x4afdd5` | 1      | `1`   | (reg)       | `2`       | `PROGRAM_KEY`      | **One-shot key programming, uses table #2** |
+| `0x4afe07` | 1      | `5`   | (reg)       | (reg)     | `READ_RESULT`      | after `PROGRAM_KEY` — read response          |
+| `0x4b041b` | 1      | `2`   | `1`         | (reg)     | `READ_WC`          | Read write counter                           |
+
+Two observations matter:
+
+1. **`gen_nonce = 1` is *not* ISP-specific.** The BGA-socket CMD18
+   call (0x49da64) sets it just like the ISP call (0x4a9a64). The
+   nonce is part of every normal CMD18 frame, not a marker of "ISP
+   mode". My earlier §27.4 implied otherwise — that was wrong.
+
+2. **There is exactly one `PROGRAM_KEY` call site (0x4afdd5)**, and
+   it always uses `key_src = 2` (the second hardcoded key table at
+   `DAT_007C8048`). Anyone reproducing the RPMB flow from our code
+   must surface this gate behind an explicit user opt-in, because
+   `PROGRAM_KEY` is one-shot per chip — running it the wrong way
+   permanently disables RPMB writes.
+
+### 29.3 ISP-read flow corrected to the BGA-equivalent
+
+Combined with §28.2 (`FUN_004fc156` is `CreateFile`, not partition
+switch), the ISP-read flow inside `FUN_004a98f0` is now:
+
+```c
+open_dump_file(host_path);            // FUN_004fc156 — just a file
+while (block_count_left > 0) {
+    bulk_write_setup(/*req=*/4, /*gen_nonce=*/1, /*key=*/0);   // CMD18 setup
+    bulk_read_data(64 sectors = 32 KB);
+    write_sectors_to_dump_file();
+    block_count_left -= …;
+}
+```
+
+There is **no separate "ISP" handling** in this function aside from
+the entry conditions on `variant` high byte (§27.1, kept). The
+session is byte-for-byte the same shape as a BGA read.
+
+That removes another worry — our prototype's `bulk_read()` does not
+need an "ISP mode" flag; it can build the same Format C / Format D
+pair for any normal eMMC read regardless of how the chip is wired.
