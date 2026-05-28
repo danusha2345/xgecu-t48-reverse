@@ -90,6 +90,39 @@ class LongRecvSubOp:
 
 
 # ============================================================
+# T48 voltage tables (recovered from minipro/src/t48.c)
+# These are the *actual* voltages corresponding to indices 0..63
+# used in SET_VCC_VOLTAGE / SET_VPP_VOLTAGE / SET_VCCIO_VOLTAGE.
+# ============================================================
+
+# 64-step VCC table — feeds the on-board VCC DAC.
+VCC_MAP = (
+    0.00, 1.74, 1.83, 1.89, 2.00, 2.07, 2.18, 2.23,
+    2.32, 2.41, 2.45, 2.56, 2.65, 2.73, 2.79, 2.90,
+    3.02, 3.08, 3.16, 3.28, 3.33, 3.42, 3.48, 3.57,
+    3.65, 3.75, 3.84, 3.89, 3.97, 4.08, 4.16, 4.23,
+    4.31, 4.40, 4.48, 4.55, 4.65, 4.71, 4.80, 4.88,
+    4.97, 5.05, 5.14, 5.18, 5.29, 5.37, 5.45, 5.54,
+    5.64, 5.76, 5.81, 5.91, 5.99, 6.06, 6.18, 6.23,
+    6.33, 6.37, 6.45, 6.54, 6.62, 6.72, 6.80, 6.86,
+)
+# 64-step VPP table — programming voltage for UV-EPROM-style chips.
+VPP_MAP = (
+     9.31,  9.56,  9.83, 10.11, 10.32, 10.60, 10.87, 11.14,
+    11.32, 11.61, 11.86, 12.15, 12.35, 12.63, 12.90, 13.18,
+    13.35, 13.62, 13.88, 14.16, 14.38, 14.66, 14.92, 15.19,
+    15.39, 15.65, 15.93, 16.19, 16.43, 16.70, 16.95, 17.23,
+    17.22, 17.48, 17.76, 18.04, 18.26, 18.53, 18.80, 19.07,
+    19.25, 19.52, 19.80, 20.07, 20.30, 20.56, 20.85, 21.10,
+    21.27, 21.56, 21.82, 22.10, 22.31, 22.59, 22.86, 23.13,
+    23.32, 23.58, 23.86, 24.13, 24.37, 24.63, 24.90, 25.16,
+)
+# 5-step VCCIO table (used only for classic chips' IO; eMMC uses
+# variant-encoded VCCQ instead — see PROTOCOL.md §20.3).
+VCCIO_MAP = (2.35, 2.47, 2.93, 3.23, 3.45)
+
+
+# ============================================================
 # JEDEC eMMC constants
 # ============================================================
 class Ecsd:
@@ -293,6 +326,53 @@ class T48Emmc:
         """CMD12 STOP + CMD13 SEND_STATUS."""
         self.ep1_send(pack_cmd_A(EmmcSubOp.STOP_AND_STATUS, 0))
         return self.ep1_recv(8)
+
+    # ---- voltage commands (classic-chip API; for eMMC voltages are
+    #      baked into BEGIN_TRANSACTION via the chip's variant field) ----
+    def set_vcc_voltage(self, vcc_index: int) -> None:
+        """SET_VCC (opcode 0x1B / SET_VCC_PIN sub-form, minipro-style).
+        Pkt: msg[0]=0x2E, msg[0x10]=j1vcc, msg[0x16]=vcc_index (1..63),
+        sends 48 bytes EP1 OUT. See minipro src/t48.c.
+        Index → real volts: VCC_MAP[vcc_index]."""
+        assert 0 <= vcc_index < 64
+        msg = bytearray(48)
+        msg[0] = 0x2E                       # T48_SET_VCC_PIN
+        msg[0x16] = vcc_index               # voltage index
+        self.ep1_send(bytes(msg))
+
+    def set_vpp_voltage(self, vpp_index: int) -> None:
+        """SET_VPP_PIN sub-cmd 1 — programming voltage (UV-EPROM etc.)."""
+        assert 0 <= vpp_index < 64
+        msg = bytearray(48)
+        msg[0] = 0x2F                       # T48_SET_VPP_PIN
+        msg[1] = 1                          # sub-cmd: set VPP voltage
+        msg[8] = vpp_index
+        self.ep1_send(bytes(msg))
+
+    def set_vccio_voltage(self, vccio_index: int) -> None:
+        """SET_VPP_PIN sub-cmd 2 — IO voltage for classic chips (5 steps)."""
+        assert 0 <= vccio_index < 5
+        msg = bytearray(48)
+        msg[0] = 0x2F                       # T48_SET_VPP_PIN
+        msg[1] = 2                          # sub-cmd: set VCCIO voltage
+        msg[8] = vccio_index
+        self.ep1_send(bytes(msg))
+
+    def measure_voltages(self) -> dict:
+        """MEASURE_VOLTAGES (top-op 0x33) — read back live rail voltages.
+        Mirrors minipro t48_measure_voltages. Returns dict with keys
+        'vpp', 'vusb', 'vcc', 'vccio' (volts, float)."""
+        msg = bytearray(16)
+        msg[0] = 0x33
+        self.ep1_send(bytes(msg))
+        reply = self.ep1_recv(24)
+        u16 = lambda o: reply[o] | (reply[o+1] << 8)
+        return {
+            'vpp':   u16(8)  * 0x0F78  / 0x1000 / 100.0,
+            'vusb':  u16(12) * 0xCCF6  / 0x27000 / 100.0,
+            'vcc':  (u16(16) * 0xB32E  / 0x27000 - 0x14) / 100.0,
+            'vccio': u16(20) * 0x0294  / 0x1000 / 100.0,
+        }
 
     # ---- session start: BEGIN_TRANSACTION + pin check + OVC check ----
     def begin_transaction(self, packet64: bytes) -> bytes:

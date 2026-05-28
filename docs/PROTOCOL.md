@@ -1003,3 +1003,232 @@ if result['ovc']:
 `FUN_004dbd00` (§19.12) configures `PIPE_TRANSFER_TIMEOUT` on `0x81 / 0x82 / 0x83`
 before long operations (eMMC EXT_CSD read uses 5 000 ms timeout, normal
 reads use 50 000 ms). Always set this before a long-running session.
+
+---
+
+## 21. Voltages: the *full* picture (correction)
+
+I previously sketched "VCC = 3.0 V (fixed)" for eMMC. That's only how the
+Xgpro UI labels the three discrete VCCQ presets for eMMC operations — the
+underlying T48 hardware is far more capable.
+
+### 21.1 Real DAC ranges (from minipro)
+
+| Rail   | Steps | Range (V)             | Step (typ.) | API in classic minipro                   |
+|--------|------:|-----------------------|-------------|------------------------------------------|
+| VCC    |   64  | **1.74 .. 6.86**      | ~0.08 V     | `t48_set_vcc_voltage(index 0..63)`        |
+| VPP    |   64  | **9.31 .. 25.16**     | ~0.25 V     | `t48_set_vpp_voltage(index 0..63)`        |
+| VCCIO  |    5  | 2.35, 2.47, 2.93, 3.23, 3.45 | — | `t48_set_vccio_voltage(index 0..4)`      |
+| VUSB   |     — | (measure only)        | —           | reported by `MEASURE_VOLTAGES`            |
+
+The exact tables (`VCC_MAP`, `VPP_MAP`, `VCCIO_MAP`) are reproduced in
+`examples/t48_emmc.py`.
+
+### 21.2 How a voltage is actually set
+
+```
+SET_VCC voltage:
+   msg[0]=0x2E (T48_SET_VCC_PIN), msg[0x10]=J13/J14 enable bits,
+   msg[0x14]=0 (DAC hold), msg[0x16]=vcc_index (1..63)
+   → send 48 bytes EP1 OUT.
+
+SET_VPP voltage (programming voltage):
+   msg[0]=0x2F (T48_SET_VPP_PIN), msg[1]=0x01 (sub-cmd "set VPP"),
+   msg[8]=vpp_index (0..63)
+   → send 48 bytes EP1 OUT.
+
+SET_VCCIO voltage (5-step IO voltage):
+   msg[0]=0x2F, msg[1]=0x02 (sub-cmd "set VCCIO"), msg[8]=vccio_index (0..4)
+   → send 48 bytes EP1 OUT.
+```
+
+### 21.3 Reading the rails back
+
+```
+MEASURE_VOLTAGES (opcode 0x33):
+   msg[0]=0x33, zero-padded to 16 bytes → send EP1 OUT (16)
+   recv 24 bytes EP1 IN, then:
+       vpp_volts   = u16(reply[8])  * 0x0F78 / 0x1000 / 100
+       vusb_volts  = u16(reply[12]) * 0xCCF6 / 0x27000 / 100
+       vcc_volts   = (u16(reply[16]) * 0xB32E / 0x27000 - 0x14) / 100
+       vccio_volts = u16(reply[20]) * 0x0294 / 0x1000 / 100
+```
+
+This lets the host verify what the DAC is *actually* outputting,
+including before connecting a chip. Match against what was requested as
+a sanity check.
+
+### 21.4 Where eMMC fits in
+
+For eMMC sessions Xgpro does **not** invoke `SET_VCC_VOLTAGE` or
+`SET_VPP_VOLTAGE` separately. The voltages get encoded into the 64-byte
+`BEGIN_TRANSACTION` packet itself (see §20.2) by way of the chip's
+`variant` field. The UI labels — `VCC=3.0V VCCQ={1.2,1.8,3.0}V` — are
+just the three normal eMMC IO-voltage classes (HS-200 / HS-400 / legacy).
+Behind those labels the T48 firmware sets up the VCC DAC and the IO-bank
+power independently — fine-trim `+0.0..+0.3 V` is also exposed in the UI
+for stability tuning.
+
+For our own software, this means: for eMMC use `begin_transaction(...)`,
+not the discrete VCC/VPP setters. The discrete setters are for the
+classic-chip path.
+
+---
+
+## 22. **Safe operating procedure** — *do not skip*
+
+> ⚠️ This section is the most important one if you're building / testing
+> something against a real eMMC. **Setting the wrong VCCQ (e.g. driving
+> 3.3 V into a 1.8 V eMMC) destroys the chip — and possibly the host
+> SoC sharing the same rail — in milliseconds.**
+
+### 22.1 One-time bench setup
+
+1. **First-power-up of the T48 itself:** plug it into the PC with **no
+   chip and no adapter** in the ZIF socket. Run Xgpro → `Tools →
+   System Self-check` once. The selftest sequence (`SELFTEST_SET_VCC`,
+   `SELFTEST_SET_VPP`, `SELFTEST_SET_GND`, `SELFTEST_READ_IO`) verifies
+   every rail and every pin driver. **Do not skip this on a new unit.**
+2. **Sacrificial eMMC for prototyping:** for early USB-protocol
+   experiments, use a *cheap dead-phone eMMC* on a breakout board, not
+   a working device. Trying things on a $2000 phone PCB is how people
+   brick boot partitions and find out CMD25 wrote the wrong address.
+
+### 22.2 Per-session pre-flight (do every time)
+
+Before issuing **any** USB command that could energise the target:
+
+1. **Identify the chip by datasheet, not by guess.** Get the
+   manufacturer + part number, look up VCCQ tolerance (1.7–1.95 V for
+   "1.8 V" parts; 2.7–3.6 V for "3.3 V" parts). A 1.8 V eMMC has no
+   meaningful tolerance for 3.3 V.
+2. **Pick the right chip variant in our database
+   (`emmc_chips_t48.json`).** For ISP work:
+     - `_(ISP)_1Bit` with `_18` suffix → variant `0x4100`, VCCQ = 1.8 V
+     - `_(ISP)_1Bit` with `_33` suffix → variant `0x4133`, VCCQ = 3.3 V
+     - `_(ISP)_4Bit` with `_18`         → variant `0x4400`, VCCQ = 1.8 V
+     - `_(ISP)_4Bit` with `_33`         → variant `0x4433`, VCCQ = 3.3 V
+   The `_18` / `_33` suffix in the `.alg` file name is the suffix of the
+   variant low byte (`0x00` = nothing → 1.8 V, `0x33` = `'3'` → 3.3 V).
+3. **Wire ISP per the user-guide diagram.** Minimum 6 wires:
+   `GND` × 2, `CLK`, `CMD`, `DAT0`, `VCCQ`. Two grounds, not one — the
+   second ground stabilises the CLK return path. CLK series resistor on
+   the board should be **removed** for high-frequency reliability.
+4. **`RST_n` of the eMMC must idle high.** Verify with a multimeter that
+   `RST_n` reads close to `VCCQ` with everything *powered but idle*.
+   If it sits at 0, add a ~1 kΩ pull-up to `VCCQ` per the user guide,
+   otherwise the eMMC never exits reset and the programmer reports
+   `EMMC Init ERROR` (best case) or appears dead (worst case).
+5. **Stop the host SoC.** If the eMMC is soldered to a phone/router/TV
+   PCB, the host CPU will fight the T48 for the eMMC bus the moment
+   power is applied. The user guide's recipe is to **ground the host
+   MCU's crystal** to stop its clock. Verify the host stays in reset
+   before continuing.
+6. **Genuine adapter only.** XGecu's EMMC-ISP VER 1.00 adapter has a
+   secure-element that the firmware authenticates with. Counterfeit
+   adapters cause `Adapter not matched, use:` errors *before* any
+   chip-side power is applied, which is also a safety feature.
+
+### 22.3 Programmer-safe start-up sequence
+
+The order matters. From cold:
+
+1. **PC ← USB ← T48** (programmer connected to host, but Xgpro / our
+   program **not yet running** any operation).
+2. **Adapter into ZIF.** ZIF lever down.
+3. **Adapter probe → target board ISP points.** Probe is *not yet*
+   powered (the T48 firmware decides when to switch on its rails).
+4. **Target board power-on.** This brings `VCCQ` *from the target side*
+   up to whatever the target board uses (often 1.8 V supplied by the
+   target's own PMIC). Verify with a meter at the probe pins:
+   `VCCQ` ≈ what your chip variant declares.
+5. **Open the software / run the prototype.** The first command our
+   program (or Xgpro) sends is the 64-byte `BEGIN_TRANSACTION`:
+   - The T48 firmware now configures its IO drivers for the chosen
+     variant, and immediately follows with `REQUEST_STATUS` (opcode
+     `0x39`) — recv 32 bytes — and checks `reply[12] & 0x01`.
+   - If `OVC` flag is set, the firmware has already de-energised the
+     driver. Our software must then send `END_TRANSACTION` with byte 1
+     = `0x01` (the Xgpro convention) and **abort** the session. **Do
+     not retry without diagnosing why** — `External short or IC reverse
+     or incorrect package!` is the firmware's three best guesses.
+6. **Only after a clean `BEGIN_TRANSACTION`** do we issue opcode `0x21`
+   (eMMC init), then `0x05` (CID), `0x06` (CSD), then the CMD6 SWITCH
+   to HS-200 — and only then any user-level read/write.
+
+### 22.4 During the session
+
+- **Treat every reply as opt-in valid.** Status byte at `reply[1]`
+  (Format A / Format B short reply) is `0` for OK; non-zero is an
+  error code — abort the operation, don't pretend it succeeded.
+- **Cap operation time** with the per-pipe timeout (see §19.12 /
+  §20.6). For ECSD reads use ~5 s, for full-USER reads use minutes
+  (Xgpro uses 50 s per chunk by default).
+- **Periodic OVC re-check.** A clean `BEGIN_TRANSACTION` doesn't
+  guarantee the rails stay clean. After every CMD25 burst, after
+  every partition switch, before every long bulk-read — send
+  `REQUEST_STATUS` and check `reply[12] & 0x01`. If it flips to 1,
+  bail out immediately.
+
+### 22.5 End-of-session — *always*
+
+```
+1. STOP_AND_STATUS (Format A, sub-op 0x4C, arg=0)     // CMD12 stop in-flight transfer
+2. SWITCH back to USER access (op 0x46, arg 0x02B30700) // restore default partition view
+3. END_TRANSACTION (top-op 0x04, byte1=0)               // release programmer
+4. Pull the probe off the target *before* powering the target down
+5. Power down the target, then close the program / unplug USB
+```
+
+If anything in steps 1–3 fails, still do steps 4–5 in order.
+Powering down the target while the programmer is still driving signals
+into it is a common way to latch up the chip.
+
+### 22.6 Common ways to brick a chip — and how to avoid each
+
+| Mistake                                          | Result                | Prevention                                   |
+|--------------------------------------------------|-----------------------|----------------------------------------------|
+| Pick `_33` variant for a 1.8 V chip              | Chip destroyed in ms  | Verify VCCQ from datasheet *before* coding the variant. |
+| Power the target before plugging the probe       | Bus contention spike  | Probe first, target power second.            |
+| Skip the RST_n pull-up                           | Init fails, sometimes latch-up | 1 kΩ to VCCQ, verified with meter.    |
+| Run with host SoC still clocking                 | CRC errors / latch-up | Ground the host MCU crystal pad.             |
+| Treat OVC as transient and retry                 | Hard short → damage   | Abort, fix wiring, only then retry.          |
+| Write to RPMB without the right Auth-Key         | RPMB permanently bricked | Don't enable RPMB write unless you have the key on file. |
+| Disconnect USB mid-operation                     | eMMC in undefined state | End_TRANSACTION first, then unplug.          |
+| Use a counterfeit adapter that bypasses auth     | All bets are off      | Genuine XGecu EMMC-ISP VER 1.00 only.        |
+
+### 22.7 Quick safety-wrapper in code
+
+The prototype's `begin_session_with_ovc_check()` already enforces the
+pre-flight OVC check. For long sessions, wrap operations like this:
+
+```python
+emmc = T48Emmc(); emmc.connect()
+try:
+    result = emmc.begin_session_with_ovc_check(packet64)
+    if not result['success']:
+        raise RuntimeError("OVC tripped: " + ovc_diagnosis(result['status']))
+
+    info = emmc.init_emmc(algo_param)             # CMD0/1/2/3 init
+    if info['ocr'] is None or info['cid'] is None:
+        raise RuntimeError("eMMC did not respond cleanly to init")
+
+    # Periodic OVC re-check before every long op
+    for chunk_idx in range(...):
+        if emmc.check_ovc():
+            raise RuntimeError("OVC tripped mid-session")
+        data = emmc.bulk_read(N_SECTORS_PER_CHUNK)
+        # ...
+finally:
+    try: emmc.stop_and_status()
+    except Exception: pass
+    try: emmc.restore_user_access()
+    except Exception: pass
+    try: emmc.end_transaction(0)
+    except Exception: pass
+    emmc.close()
+```
+
+The `try / except` around every shutdown step ensures the programmer
+gets released even if one cleanup step fails — important to avoid
+leaving the eMMC bus driven while the host process exits.
