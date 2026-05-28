@@ -77,11 +77,37 @@ class TopOp:
 class EmmcSubOp:
     """Sub-opcode = byte[1] under top-opcode 0x27."""
     SWITCH          = 0x46    # CMD6 SWITCH (arg = BE-encoded JEDEC argument)
-    STOP_AND_STATUS = 0x4C    # CMD12 STOP + CMD13 SEND_STATUS
-    COMMIT          = 0x4D    # finalize FPGA (password / RPMB write)
+    STOP            = 0x4C    # CMD12 STOP_TRANSMISSION
+    SEND_STATUS     = 0x4D    # CMD13 SEND_STATUS (read 32-bit CARD STATUS)
     DATA_BLOCK_512  = 0x50    # 512-byte data transfer (CMD24 / OTP / RPMB data)
     SET_BLOCK_COUNT = 0x57    # CMD23 SET_BLOCK_COUNT (arg = count, usually 1)
     READ_WGP_TABLE  = 0x5D    # read Write-Group Protection table
+    # Back-compat aliases
+    STOP_AND_STATUS = 0x4C    # deprecated: kept for old callers
+    COMMIT          = 0x4D    # deprecated: kept for old callers
+
+
+# JEDEC eMMC CARD STATUS (R1 response) bits
+CARD_STATUS_CURRENT_STATE_MASK = 0x00001E00   # bits [12:9]
+CARD_STATUS_CURRENT_STATE_TRAN = 4 << 9       # = 0x800
+CARD_STATUS_READY_FOR_DATA     = 1 << 8       # bit 8 in JEDEC; Xgpro uses bit 25 differently
+
+# Xgpro internal status decoder error codes (reply[0] of Format A reply)
+XGPRO_STATUS_OK            = 0
+XGPRO_STATUS_GENERIC       = 1
+XGPRO_STATUS_CMD_CRC_ERR   = 2
+XGPRO_STATUS_CMD1_RESP_ERR = 3
+XGPRO_STATUS_CMD1_NORESP   = 4
+XGPRO_STATUS_CMD_NORESP    = 5
+XGPRO_STATUS_BUSY          = 6
+XGPRO_STATUS_NO_DATA_RESP  = 7
+XGPRO_STATUS_DATABUS_CRC   = 8    # "Reduce CLK or switch VCCQ 1.8↔3.3V"
+XGPRO_STATUS_WRITE_CRC     = 9
+XGPRO_STATUS_DAT0_BUSY     = 10
+XGPRO_STATUS_TIMEOUT_E1    = 0xE1
+XGPRO_STATUS_TIMEOUT_E2    = 0xE2
+XGPRO_STATUS_TIMEOUT_E3    = 0xE3
+XGPRO_STATUS_TIMEOUT_EE    = 0xEE
 
 
 class LongRecvSubOp:
@@ -322,10 +348,46 @@ class T48Emmc:
         self.ep1_send(pack_cmd_A(EmmcSubOp.SET_BLOCK_COUNT, n))
         return self.ep1_recv(8)
 
-    def stop_and_status(self) -> bytes:
-        """CMD12 STOP + CMD13 SEND_STATUS."""
-        self.ep1_send(pack_cmd_A(EmmcSubOp.STOP_AND_STATUS, 0))
+    def stop_transmission(self) -> bytes:
+        """CMD12 STOP_TRANSMISSION (Format A sub-op 0x4C)."""
+        self.ep1_send(pack_cmd_A(EmmcSubOp.STOP, 0))
         return self.ep1_recv(8)
+
+    # Back-compat
+    stop_and_status = stop_transmission
+
+    def read_card_status(self) -> tuple:
+        """CMD13 SEND_STATUS — read JEDEC eMMC CARD STATUS register.
+
+        Returns (xgpro_error_code, card_status_u32).
+            xgpro_error_code: reply[0] — see XGPRO_STATUS_* constants
+            card_status_u32 : reply[4..8] — the JEDEC R1 register
+        """
+        # The exact 8-byte packet from FUN_004929f0:
+        self.ep1_send(struct.pack('<BBHI', 0x27, 0x4D, 0x0001, 0x00010000))
+        reply = self.ep1_recv(8)
+        err = reply[0]
+        card_status = struct.unpack_from('<I', reply, 4)[0]
+        return err, card_status
+
+    def wait_for_tran_state(self, max_iter: int = 10000) -> bool:
+        """Poll CMD13 until CURRENT_STATE = TRAN (= 4 << 9 = 0x800).
+        Mirrors Xgpro's erase / programming wait loop in FUN_004acee0.
+        Returns True on TRAN reached, False on timeout / error.
+        Sends a CMD12 STOP between polls (matches Xgpro behaviour)."""
+        while max_iter > 0:
+            err, card_status = self.read_card_status()
+            if err != XGPRO_STATUS_OK and err != XGPRO_STATUS_GENERIC:
+                return False
+            if (card_status & CARD_STATUS_CURRENT_STATE_MASK) \
+                    == CARD_STATUS_CURRENT_STATE_TRAN:
+                return True
+            try:
+                self.stop_transmission()
+            except Exception:
+                return False
+            max_iter -= 1
+        return False
 
     # ---- voltage commands (classic-chip API; for eMMC voltages are
     #      baked into BEGIN_TRANSACTION via the chip's variant field) ----

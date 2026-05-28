@@ -1214,6 +1214,91 @@ T48 pin-test в minipro = ~30 строк патча.
 > нём отключится навсегда. Наш `build_rpmb_frame()` берёт `key_mac` явным
 > параметром именно чтобы этого не случилось случайно.
 
+## 25. CARD STATUS — semantics и error-коды
+
+### 25.1 Поправка: sub-op `0x4D` это **НЕ** «commit»
+
+Раньше (§19.4, §20.2) я писал что sub-op `0x4D` — это «commit / finalize FPGA».
+**Это была ошибка.** 5-й проход Ghidra нашёл `FUN_004929f0` — функцию
+чтения card status — и она отправляет:
+
+```c
+uint8_t pkt[8] = {
+    0x27,    // byte 0 — top-opcode (Format A)
+    0x4D,    // byte 1 — sub-opcode  ← CMD13 SEND_STATUS!
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+};
+```
+
+Так что **sub-op `0x4D` = CMD13 SEND_STATUS** (читает 32-бит CARD STATUS
+register eMMC). Раньше меня сбила толку контекст «Set Password» —
+там просто опрос статуса после записи.
+
+**Обновлённая таблица sub-op'ов Format A:**
+
+| Sub-op | Семантика (исправлено)                                  |
+|--------|---------------------------------------------------------|
+| `0x46` | CMD6 SWITCH                                             |
+| `0x4C` | CMD12 STOP_TRANSMISSION                                 |
+| **`0x4D`** | **CMD13 SEND_STATUS** (исправлено)                  |
+| `0x50` | Data transfer 512 байт (CMD24 / OTP / RPMB write data)  |
+| `0x57` | CMD23 SET_BLOCK_COUNT                                   |
+| `0x5C` | TBD (1 call site)                                       |
+| `0x5D` | Read WP table                                           |
+
+### 25.2 Decoder error-кодов (`FUN_004b32f0`)
+
+`FUN_004b32f0` — центральный status decoder. Каждое error-сообщение Xgpro
+проходит через него. Расшифровка `switch(param_1 & 0xFF)`:
+
+| `reply[0]` | Значение                                                       |
+|-----------:|----------------------------------------------------------------|
+| `0`        | OK                                                             |
+| `1`        | Generic status reply                                           |
+| `2`        | CRC error (command CRC)                                        |
+| `3`        | CMD1 respond error (init OCR mismatch)                         |
+| `4`        | CMD1 no response                                               |
+| `5`        | CMDx no response                                               |
+| `6`        | eMMC busy                                                      |
+| `7`        | "No Data respond" (если bit 25 `param_2` = 0)                  |
+| `8`        | DataBus CRC error → подсказка *"Reduce CLK или switch VCCQ"*    |
+| `9`        | Write CRC error                                                |
+| `10`       | eMMC `DAT0` busy (если bit 25 `param_2` = 0)                   |
+| `0xE1`     | "EMMC stops responding 1" (firmware timeout)                   |
+| `0xE2`     | "EMMC stops responding 2"                                      |
+| `0xE3`     | "EMMC stops responding 3"                                      |
+| `0xEE`     | "EMMC stops responding 0"                                      |
+
+`param_2` — это **JEDEC eMMC CARD STATUS register** (R1 response, 32 бита):
+
+| Биты   | Поле               | Значение                              |
+|-------:|--------------------|---------------------------------------|
+| 25     | `READY_FOR_DATA`   | 1 = чип готов принять данные          |
+| 12..9  | `CURRENT_STATE`    | Состояние машины:                     |
+|        |                    | 0=IDLE, 1=READY, 2=IDENT, 3=STBY, **4=TRAN**, 5=DATA, 6=RCV, 7=PRG, 8=DIS, 9=BTST, 10=SLP |
+
+### 25.3 Erase wait loop (`FUN_004acee0`)
+
+```c
+int max_iter = 10000;
+int rc = read_card_status(handle, &status_buf);   // Format A op 0x4D
+while (rc != -1) {
+    uint32_t card_status = *(uint32_t*)&status_buf[4];
+    if ((card_status & 0x1E00) == 0x800) break;    // CURRENT_STATE == TRAN
+    rc = format_A_cmd(handle, /*sub_op=*/0x4C, 0, &status_buf);  // CMD12 STOP
+    if (rc == -1) { report(" -- CMD12"); break; }
+    if (--max_iter == 0) { report(" -- Erase Timeout"); break; }
+    rc = read_card_status(handle, &status_buf);
+}
+```
+
+Главное:
+- **CMD13** через sub-op `0x4D` (НЕ через top-op `0x39` — тот REQUEST_STATUS
+  программатора, с OVC@12).
+- 32-бит CARD STATUS читается из `reply[4..8]`.
+- Polling до `CURRENT_STATE == 4 (TRAN)`, CMD12 между опросами.
+- 10000 итераций ≈ полное стирание чипа; иначе "Erase Timeout".
+
 ### 24.1 Two-step «Program Key»
 
 ```

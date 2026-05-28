@@ -1477,3 +1477,129 @@ happen by accident.
 (The mapping of `byte 0x1FF & 7` to the status code comes from the
 JEDEC RPMB standard; Xgpro's check `if ((bStack_12003 & 7) == 0)`
 matches "OK".)
+
+---
+
+## 25. CARD STATUS semantics and error codes
+
+### 25.1 Correction: sub-op `0x4D` is *not* "commit"
+
+Earlier (§19.4, §20.2) I had labelled sub-op `0x4D` as "commit / finalize
+FPGA". That was wrong. The fifth Ghidra pass found `FUN_004929f0` —
+the card-status reader called from the erase wait loop — and it sends:
+
+```c
+uint8_t pkt[8] = {
+    0x27,    // byte 0 — top-opcode (Format A)
+    0x4D,    // byte 1 — sub-opcode  ← CMD13 SEND_STATUS
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00,   // count + arg
+};
+raw_send(handle, pkt, 8);
+raw_recv(handle, reply, 8);
+```
+
+So sub-op `0x4D` is **CMD13 `SEND_STATUS`** — reads the eMMC card's
+32-bit CARD STATUS register. The "Set Password" context that misled me
+earlier was just code paths that happen to poll status after writing.
+
+**Updated Format A sub-op table:**
+
+| Sub-op | Semantics (corrected)                                         |
+|--------|---------------------------------------------------------------|
+| `0x46` | CMD6 SWITCH                                                   |
+| `0x4C` | CMD12 STOP_TRANSMISSION                                       |
+| **`0x4D`** | **CMD13 SEND_STATUS** (status read — corrected from "commit") |
+| `0x50` | Data transfer 512 B (CMD24 / OTP / RPMB-write data phase)     |
+| `0x57` | CMD23 SET_BLOCK_COUNT                                         |
+| `0x5C` | TBD (1 call site)                                             |
+| `0x5D` | Read WP table                                                 |
+
+### 25.2 Status reply: error-code decoder
+
+`FUN_004b32f0` is the central status decoder — every error string Xgpro
+prints when something goes wrong is routed through this function.
+Reverse-engineering its `switch (param_1 & 0xFF)` gives the full
+Xgpro error-code map:
+
+| `reply[0]` | Meaning                                                          |
+|-----------:|------------------------------------------------------------------|
+| `0`        | OK                                                               |
+| `1`        | Generic status reply (data in `param_2`)                         |
+| `2`        | CRC error (command CRC)                                          |
+| `3`        | CMD1 respond error (init OCR mismatch)                           |
+| `4`        | CMD1 no response                                                 |
+| `5`        | CMDx no response (`%.8X` codes embedded)                          |
+| `6`        | eMMC busy                                                        |
+| `7`        | "No Data respond" (when bit 25 of `param_2` is clear)            |
+| `8`        | DataBus CRC error → UI hint *"Reduce CLK or switch VCCQ 1.8↔3.3 V"* |
+| `9`        | Write CRC error                                                  |
+| `10`       | eMMC `DAT0` busy (when bit 25 of `param_2` is clear)             |
+| `0xE1`     | "EMMC stops responding 1" (firmware-level timeout)               |
+| `0xE2`     | "EMMC stops responding 2"                                        |
+| `0xE3`     | "EMMC stops responding 3"                                        |
+| `0xEE`     | "EMMC stops responding 0"                                        |
+
+The companion `param_2` is the **JEDEC eMMC CARD STATUS register**
+(R1 response, 32 bits), with the relevant subfields:
+
+| Bit(s) | Field                  | Meaning                                  |
+|-------:|------------------------|------------------------------------------|
+| 25     | `READY_FOR_DATA`       | 1 = chip will accept the next data       |
+| 12..9  | `CURRENT_STATE`        | Card state machine value:                |
+|        |                        | 0=IDLE, 1=READY, 2=IDENT, 3=STBY, **4=TRAN**, 5=DATA, 6=RCV, 7=PRG, 8=DIS, 9=BTST, 10=SLP |
+
+`CURRENT_STATE == TRAN (4)` means "ready for next command", which is
+why the erase wait loop in §25.3 uses `& 0x1E00 == 0x800` (= `4 << 9`).
+
+### 25.3 Erase / programming wait loop (`FUN_004acee0`)
+
+```c
+int max_iter = 10000;                             // hard timeout
+int rc = read_card_status(handle, &status_buf);   // Format A op 0x4D
+while (rc != -1) {
+    uint32_t card_status = *(uint32_t*)&status_buf[4];
+    if ((card_status & 0x1E00) == 0x800) {        // CURRENT_STATE == TRAN
+        // erase / write finished, card is ready
+        break;
+    }
+    rc = format_A_cmd(handle, /*sub_op=*/0x4C, /*arg=*/0, &status_buf);  // CMD12
+    if (rc == -1) {
+        report(" -- CMD12");                       // CMD12 itself failed
+        break;
+    }
+    if (--max_iter == 0) {
+        decode_status(status_buf, " -- Erase Timeout");
+        break;
+    }
+    rc = read_card_status(handle, &status_buf);    // re-poll
+}
+```
+
+Takeaways:
+- Use sub-op `0x4D` for **CMD13 SEND_STATUS** (NOT 0x39 — that one is
+  `REQUEST_STATUS` of the programmer itself, which carries OVC at byte 12).
+- Read the **32-bit eMMC CARD STATUS** from `reply[4..8]`.
+- Loop until `CURRENT_STATE == 4 (TRAN)`, send `CMD12` between polls.
+- 10000 iterations ≈ enough for full-chip erase; abort with
+  "Erase Timeout" otherwise.
+
+### 25.4 Updated sub-op `0x4D` packet (Ghidra-verified)
+
+```
+byte 0: 0x27   top-opcode (Format A dispatcher)
+byte 1: 0x4D   sub-opcode = CMD13 SEND_STATUS
+byte 2: 0x01   ?  (always 1 in Xgpro — possibly "RCA index" or "argument bits 23..16")
+byte 3: 0x00
+byte 4: 0x00
+byte 5: 0x00
+byte 6: 0x01   ?  (always 1 — possibly "fetch full 32-bit status")
+byte 7: 0x00
+```
+
+Reply: 8 bytes, layout matches Format A:
+
+```
+byte 0: error code (see §25.2 table)
+byte 1: ?
+byte 4..8: 32-bit eMMC CARD STATUS register (LE)
+```
