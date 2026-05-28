@@ -1086,3 +1086,147 @@ finally:
 `try / except` вокруг каждого shutdown-шага гарантирует освобождение
 программатора, даже если один из cleanup-шагов упал — критично, чтобы
 не оставлять eMMC bus под напряжением при выходе процесса.
+
+### 22.8 Pre-flight self-check (Ghidra-decoded)
+
+Xgpro System Self-check (`FUN_004532e0`) — это **самый безопасный паттерн
+активации**, который сам firmware использует для самопроверки. Можно
+воспроизвести в своём ПО для проверки железа без чипа в socket'е.
+
+```
+PRE: чип и адаптер не вставлены в ZIF.
+
+1. send 8B  [0x2D, …]                ; RESET_PIN_DRIVERS
+2. download "TestVcc.alg" битстрим   ; через top-op 0x26
+3. send 8B  0x2D                     ; reset после битстрима
+
+4. VCC test loop:
+   a. send 32B [0x2E, …]             ; SET_VCC_PIN
+   b. send 8B  [0x35, …]             ; READ_PINS
+   c. recv 40B (0x28)                ; reply[8..48] = pin status
+   d. fail → "SELFTEST_SET_VCC cmd error!"
+
+5. VPP test (то же с 0x2F):           ; SET_VPP_PIN + READ_PINS + 40B reply
+
+6. download "TestGnd.alg"
+7. 8B 0x2D
+8. GND test (32B 0x30 + 8B 0x35 + 40B reply)
+9. SET_OUT test (32B 0x36 + READ_PINS)
+10. Combined test (0x2D + 0x2E + 0x30 + 0x39 REQUEST_STATUS)
+```
+
+Test-битстримы `TestVcc.alg`/`TestGnd.alg` замыкают каждый pin driver
+на известную internal reference в FPGA — поэтому **чип не запитывается**,
+и это единственная USB-активность, **полностью безопасная без чипа**.
+
+---
+
+## 23. Ещё два top-opcode
+
+### 23.1 `0x0A` — generic eMMC CMD wrapper
+
+`FUN_00495060` (программирование CSD с OTP-битом) использует
+**32-байтный raw-пакет** оборачивающий любую JEDEC eMMC CMDxx с
+16-байтным payload'ом:
+
+```c
+struct EP1_RawCmd_0x0A {        // всего 32 байта
+    uint32_t header;            // = 0x000A0001  (top-op=0x0A)
+    uint32_t pad0;              // = 0
+    uint32_t size;              // = 0x00100000
+    uint32_t jedec_cmd;         // JEDEC eMMC CMD номер (например 0x5B = CMD27)
+    uint8_t  data[16];          // CMD аргумент / payload
+};
+// → send 0x20 байт EP1 OUT
+// → recv 8 байт EP1 IN (reply[1] = status)
+```
+
+Использование: CMD27 PROGRAM_CSD (`jedec_cmd = 0x5B`). Этот wrapper
+универсален для любой CMDxx с 16-байт data. Xgpro перед raw-send делает
+два Format-A вызова (sub-op `0x57` arg=1, потом sub-op `0x50` arg=0x10),
+после raw-send — финальный sub-op `0x50` arg=0x200 (commit).
+
+### 23.2 `0x35` — `READ_PINS` (карта пинов)
+
+Используется self-check для чтения состояния всех 40 пинов ZIF:
+
+```
+send 8B [0x35, 0,…]                    ; EP1 OUT
+recv 40B (0x28)                         ; EP1 IN
+// reply[8..48] = pin status (1 байт на pin)
+```
+
+minipro реализует для TL866II+, но **не для T48** (`pin_test = NULL` в
+T48-структуре). Опкод, размеры и layout reply совпадают — добавить
+T48 pin-test в minipro = ~30 строк патча.
+
+### 23.3 Обновлённая таблица top-opcodes (финальная)
+
+| Top-op | Источник           | Назначение                                          |
+|--------|--------------------|-----------------------------------------------------|
+| `0x02` | minipro classic    | `NAND_INIT`                                         |
+| `0x03` | both               | `BEGIN_TRANSACTION` (64 байт, и для eMMC тоже)      |
+| `0x04` | both               | `END_TRANSACTION` (8 байт; byte 1 = OVC-abort)      |
+| `0x05` | both               | `READID` (CID для eMMC init)                        |
+| `0x06` | both               | `READ_USER` (CSD для eMMC init)                     |
+| `0x08` | Xgpro NEW          | Long-recv envelope (sub `0x48` = 512B read)         |
+| **`0x0A`** | **Xgpro NEW**  | **Generic eMMC CMDxx wrapper (32 байта)**           |
+| `0x14` | Xgpro NEW          | Bulk-write setup перед EP2 OUT                      |
+| `0x1B` | minipro classic    | `SET_VCC_VOLTAGE`                                   |
+| `0x1C` | minipro classic    | `SET_VPP_VOLTAGE`                                   |
+| `0x21` | Xgpro NEW          | eMMC init / выбор алгоритма                         |
+| `0x26` | Xgpro NEW          | FPGA bitstream download (`TestVcc.alg`, `TestGnd.alg`) |
+| `0x27` | Xgpro NEW          | eMMC sub-command dispatcher                         |
+| `0x2D` | minipro classic    | `RESET_PIN_DRIVERS` (self-check между фазами)       |
+| `0x2E` | minipro classic    | `SET_VCC_PIN` (32 байта)                            |
+| `0x2F` | minipro classic    | `SET_VPP_PIN` (sub 1 = VPP, sub 2 = VCCIO)          |
+| `0x30` | minipro classic    | `SET_GND_PIN` (32 или 40 байт)                      |
+| `0x33` | minipro classic    | `MEASURE_VOLTAGES`                                  |
+| **`0x35`** | both           | **`READ_PINS`** (40 байт reply — карта пинов)       |
+| `0x36` | minipro classic    | `SET_OUT`                                           |
+| `0x39` | both               | `REQUEST_STATUS` (32 байта; OVC@12)                 |
+| `0x3F` | minipro classic    | `RESET`                                             |
+
+## 24. RPMB протокол — карта request-кодов
+
+`FUN_004afd10` показывает соответствие `req` arg в `FUN_00492670`
+с **JEDEC RPMB request кодами**:
+
+| `req` arg | JEDEC RPMB request | Назначение                                |
+|-----------|--------------------|-------------------------------------------|
+| `1`       | `0x0001 PROGRAM_KEY` | Запись 32-байт Authentication Key (one-shot) |
+| `2`       | `0x0002 READ_WC`     | Read write counter                        |
+| `3`       | `0x0003 AUTH_DATA_WRITE` | Authenticated write (1 сектор за раз) |
+| `4`       | `0x0004 AUTH_DATA_READ`  | Authenticated read                    |
+| `5`       | `0x0005 READ_RESULT`     | Чтение response register              |
+
+Два хардкод-table с ключами в static data:
+
+| Символ           | Размер | Назначение                                       |
+|------------------|--------|--------------------------------------------------|
+| `DAT_0079A690`   | 32 B   | Default/factory RPMB ключ #1                      |
+| `DAT_007C8048`   | 32 B   | Default/factory RPMB ключ #2                      |
+
+`FUN_00492670` arg `param_10` выбирает (`1` = первая table, `2` = вторая).
+
+> ⚠️ **`PROGRAM_KEY` — one-shot на чип**. Записать ключ можно только
+> один раз. Если запустить против чипа без своего ключа — RPMB-write на
+> нём отключится навсегда. Наш `build_rpmb_frame()` берёт `key_mac` явным
+> параметром именно чтобы этого не случилось случайно.
+
+### 24.1 Two-step «Program Key»
+
+```
+1. raw_send Format C req=1 (PROGRAM_KEY)
+2. raw_send Format C req=5 (READ_RESULT)
+3. raw_recv Format D count=1                          ; 512-байт response
+4. parse: byte 0x1FF & 7 = JEDEC OPERATION_RESULT:
+   0 = OK
+   1 = General failure
+   2 = Authentication failure
+   3 = Counter failure
+   4 = Address failure
+   5 = Write failure
+   6 = Read failure
+   7 = Authentication Key not yet programmed
+```

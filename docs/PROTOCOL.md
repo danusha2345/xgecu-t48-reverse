@@ -1252,7 +1252,66 @@ into it is a common way to latch up the chip.
 | Disconnect USB mid-operation                     | eMMC in undefined state | End_TRANSACTION first, then unplug.          |
 | Use a counterfeit adapter that bypasses auth     | All bets are off      | Genuine XGecu EMMC-ISP VER 1.00 only.        |
 
-### 22.7 Quick safety-wrapper in code
+### 22.7 Pre-flight self-check sequence (Ghidra-decoded)
+
+Xgpro's "System Self-check" function (`FUN_004532e0`) is the **safest
+possible activation pattern** the firmware uses to validate itself.
+We can reproduce it offline in our own software to prove the
+programmer is healthy without any chip in the socket. The exact
+sequence (op-codes and packet sizes from the decompilation):
+
+```
+PRE-CONDITION: no chip, no adapter in the ZIF socket.
+
+1. send 8B  [0x2D, 0, 0,…]               ; RESET_PIN_DRIVERS
+
+2. download "TestVcc.alg" FPGA bitstream  ; via top-op 0x26
+   (Xgpro reads the .alg from disk and uses FUN_004bb4d0).
+
+3. send 8B  [0x2D, 0, 0,…]               ; reset after bitstream load
+
+4. VCC test loop:
+   a. send 32B starting with 0x2E         ; SET_VCC_PIN — pick a pin
+   b. send 8B  [0x35, 0,…]               ; READ_PINS
+   c. recv 40B (0x28) — pin readings      ; reply[8..48] = per-pin status
+   d. if any step != 0 → "SELFTEST_SET_VCC cmd error!"
+
+5. VPP test loop:
+   a. send 32B starting with 0x2F         ; SET_VPP_PIN
+   b. send 8B  [0x35,…]                  ; READ_PINS
+   c. recv 40B
+   d. on failure → "SELFTEST_SET_VPP cmd error!"
+
+6. download "TestGnd.alg" FPGA bitstream
+
+7. send 8B [0x2D,…]                       ; reset
+
+8. GND test loop:
+   a. send 32B starting with 0x30         ; SET_GND_PIN
+   b. send 8B  [0x35,…]
+   c. recv 40B
+   d. on failure → "SELFTEST_SET_GND cmd error!"
+
+9. SET_OUT test:
+   a. 8B  0x2D
+   b. 32B 0x36                            ; SET_OUT — drive output pins
+   c. 8B  0x35
+   d. 40B reply
+
+10. Combined VCC/GND test:
+    a. 8B  0x2D
+    b. 32B 0x2E  (VCC pin set)
+    c. 40B 0x30  (GND pin set — note 40-byte form)
+    d. 8B  0x39                           ; REQUEST_STATUS
+```
+
+The pin-drivers test bitstream (`TestVcc.alg`, `TestGnd.alg`) shorts
+each driver to a known reference inside the FPGA so the host can
+verify the actual rail voltages with `MEASURE_VOLTAGES` and the pin
+states with `READ_PINS`. **No chip is energised**, so this is the only
+USB activity that's strictly safe with nothing in the socket.
+
+### 22.8 Quick safety-wrapper in code
 
 The prototype's `begin_session_with_ovc_check()` already enforces the
 pre-flight OVC check. For long sessions, wrap operations like this:
@@ -1287,3 +1346,134 @@ finally:
 The `try / except` around every shutdown step ensures the programmer
 gets released even if one cleanup step fails — important to avoid
 leaving the eMMC bus driven while the host process exits.
+
+---
+
+## 23. Two more top-opcodes recovered
+
+### 23.1 `0x0A` — generic eMMC CMD wrapper
+
+`FUN_00495060` (the OTP-CSD programming function) builds a **32-byte
+raw packet** that wraps any JEDEC eMMC CMDxx with its 16-byte data
+payload:
+
+```c
+struct EP1_RawCmd_0x0A {        // 32 bytes total
+    uint32_t header;            // = 0x000A0001  (top-op=0x0A, then 0x01 0x00 0x00)
+    uint32_t pad0;              // = 0
+    uint32_t size;              // = 0x00100000  (= 16 << 16, length of data section?)
+    uint32_t jedec_cmd;         // = the JEDEC eMMC CMD number (e.g. 0x5B for CMD27)
+    uint8_t  data[16];          // CMD argument / payload (e.g. 16 bytes raw CSD)
+};
+// → send 0x20 bytes EP1 OUT
+// → recv 8 bytes EP1 IN (reply[1] = status)
+```
+
+Observed use: `jedec_cmd = 0x5B` (CMD27 PROGRAM_CSD), but the same
+wrapper presumably carries any other CMDxx that needs a 16-byte data
+companion. Before this raw send, Xgpro warms up with two Format-A
+calls: sub-op `0x57` arg=`1` (`SET_BLOCK_COUNT`), then sub-op `0x50`
+arg=`0x10` (data-prep). After the raw send + 8B reply, a final
+sub-op `0x50` arg=`0x200` commits the write.
+
+If `reply[1]` of the 8-byte response is non-zero, the chip refused
+the command — typically the OTP bit was already set
+("WARNING: Set CSD(OTP bit) One Time Programming!").
+
+### 23.2 `0x35` — `READ_PINS` (the pin map)
+
+Used by the self-check sequence to read back the entire 40-pin ZIF
+state in one shot:
+
+```c
+send 8B  [0x35, 0, 0, 0, 0, 0, 0, 0]   ; EP1 OUT
+recv 40B (0x28)                         ; EP1 IN
+// reply[8..48] is the pin status (1 byte per pin, indices map to
+// physical ZIF pin numbers — matches minipro's tl866iiplus_pin_test).
+```
+
+minipro implements this for the TL866II+ but **not** for the T48 (the
+T48 entry in `minipro/src/t48.c` leaves `pin_test = NULL`). The
+op-code, packet sizes and reply layout all match, so adding T48
+pin-test to minipro is a 30-line patch.
+
+### 23.3 Updated top-opcode table (final-ish)
+
+| Top-op | Source             | Purpose                                                |
+|--------|--------------------|--------------------------------------------------------|
+| `0x02` | minipro classic    | `NAND_INIT`                                            |
+| `0x03` | minipro / Xgpro    | `BEGIN_TRANSACTION` (64-byte init — used for eMMC too) |
+| `0x04` | minipro / Xgpro    | `END_TRANSACTION` (8-byte; byte 1 = OVC-abort flag)    |
+| `0x05` | minipro / Xgpro    | `READID` (also used in eMMC init for CID read)         |
+| `0x06` | minipro / Xgpro    | `READ_USER` (also CSD read in eMMC init)               |
+| `0x08` | Xgpro NEW          | Long-recv envelope (e.g. sub `0x48` → 512 B read)      |
+| **`0x0A`** | **Xgpro NEW** | **Generic eMMC CMDxx wrapper (32-byte raw packet)**    |
+| `0x14` | Xgpro NEW          | Bulk-write setup before EP2 OUT                        |
+| `0x1B` | minipro classic    | `SET_VCC_VOLTAGE`                                      |
+| `0x1C` | minipro classic    | `SET_VPP_VOLTAGE`                                      |
+| `0x21` | Xgpro NEW          | eMMC init / select algorithm                           |
+| `0x26` | Xgpro NEW          | FPGA bitstream download (incl. `TestVcc.alg`, `TestGnd.alg`) |
+| `0x27` | Xgpro NEW          | eMMC sub-command dispatcher                            |
+| `0x2D` | minipro classic    | `RESET_PIN_DRIVERS` (used by self-check before each phase) |
+| `0x2E` | minipro classic    | `SET_VCC_PIN` (32-byte packet)                         |
+| `0x2F` | minipro classic    | `SET_VPP_PIN` (sub 1 = VPP voltage; sub 2 = VCCIO)     |
+| `0x30` | minipro classic    | `SET_GND_PIN` (32 or 40-byte packet)                   |
+| `0x33` | minipro classic    | `MEASURE_VOLTAGES`                                     |
+| **`0x35`** | minipro / Xgpro| **`READ_PINS`** (40-byte reply — pin map)              |
+| `0x36` | minipro classic    | `SET_OUT` (drive output pins for self-check)           |
+| `0x39` | minipro / Xgpro    | `REQUEST_STATUS` (32-byte reply incl. OVC@12)          |
+| `0x3F` | minipro classic    | `RESET`                                                |
+
+## 24. RPMB protocol — exact request-code map
+
+`FUN_004afd10` (RPMB read-write-counter + program-key) shows the
+mapping between the `req` arg of `FUN_00492670` (Format C bulk
+write) and the **JEDEC RPMB request codes**:
+
+| FUN_00492670 `req` arg | JEDEC RPMB request | Purpose                       |
+|------------------------|--------------------|-------------------------------|
+| `1`                    | `0x0001` `PROGRAM_KEY` | Write the 32-byte Authentication Key (one-shot) |
+| `2`                    | `0x0002` `READ_WC`    | Read the write counter (one of the gating bits for any RPMB write) |
+| `3`                    | `0x0003` `AUTH_DATA_WRITE` | Authenticated data write (1 sector at a time) |
+| `4`                    | `0x0004` `AUTH_DATA_READ`  | Authenticated data read |
+| `5`                    | `0x0005` `READ_RESULT`     | Read the response register (status of the last write) |
+
+Two hardcoded key tables live in static data:
+
+| Symbol           | Size  | What it likely is                                |
+|------------------|-------|--------------------------------------------------|
+| `DAT_0079A690`   | 32 B  | Default/factory RPMB authentication key #1       |
+| `DAT_007C8048`   | 32 B  | Default/factory RPMB authentication key #2       |
+
+`FUN_00492670` arg `param_10` picks which one (`1` → first table,
+`2` → second table). With `param_10 = 0` and `param_9 = 0` no key
+material is embedded, which corresponds to the `READ_WC` / `READ_RESULT`
+cases above (those frames don't carry a key).
+
+**Operational warning:** `PROGRAM_KEY` is **one-shot per chip** —
+once programmed, the key can never be changed or read back. Running
+this flow against a chip you don't own the key for permanently
+disables RPMB write on that chip. Our prototype's `build_rpmb_frame()`
+takes `key_mac` as an explicit parameter precisely so this can't
+happen by accident.
+
+### 24.1 The two-step "Program Key" flow
+
+```
+1. raw_send Format C with req=1 (PROGRAM_KEY)                     ; sends the key
+2. raw_send Format C with req=5 (READ_RESULT)                     ; sends "give me the response"
+3. raw_recv Format D (count=1)                                    ; reads the 512-byte response
+4. parse response: byte 0x1FF & 7 — the JEDEC OPERATION_RESULT:
+        0 = OK
+        1 = General failure
+        2 = Authentication failure
+        3 = Counter failure
+        4 = Address failure
+        5 = Write failure
+        6 = Read failure
+        7 = Authentication Key not yet programmed
+```
+
+(The mapping of `byte 0x1FF & 7` to the status code comes from the
+JEDEC RPMB standard; Xgpro's check `if ((bStack_12003 & 7) == 0)`
+matches "OK".)

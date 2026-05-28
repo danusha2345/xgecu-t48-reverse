@@ -358,6 +358,20 @@ class T48Emmc:
         msg[8] = vccio_index
         self.ep1_send(bytes(msg))
 
+    def reset_pin_drivers(self) -> None:
+        """RESET_PIN_DRIVERS (top-op 0x2D) — always call this between
+        voltage/pin-direction phases.  No reply."""
+        self.ep1_send(struct.pack('<BB6x', 0x2D, 0))
+
+    def read_pins(self) -> bytes:
+        """READ_PINS (top-op 0x35).  Returns 40-byte status block.
+        reply[8..48] = per-pin state (1 byte per pin, indices map to
+        physical ZIF pin numbers — same convention as minipro's
+        tl866iiplus_pin_test). Safe to call without a chip in the
+        socket once a test bitstream has been loaded."""
+        self.ep1_send(struct.pack('<BB6x', 0x35, 0))
+        return self.ep1_recv(0x28)
+
     def measure_voltages(self) -> dict:
         """MEASURE_VOLTAGES (top-op 0x33) — read back live rail voltages.
         Mirrors minipro t48_measure_voltages. Returns dict with keys
