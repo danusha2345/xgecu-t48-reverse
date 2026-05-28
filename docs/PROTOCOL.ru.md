@@ -1299,6 +1299,65 @@ while (rc != -1) {
 - Polling до `CURRENT_STATE == 4 (TRAN)`, CMD12 между опросами.
 - 10000 итераций ≈ полное стирание чипа; иначе "Erase Timeout".
 
+---
+
+## 26. Финальный реверс-проход — erase, variant-буквы, sub-op 0x5E
+
+### 26.1 Xgpro **не использует** JEDEC CMD35/36/38 для eMMC erase
+
+`FUN_0049e010` (Erase Partition, 1353 строки декомпиляции) **не содержит**
+CMD35 → CMD36 → CMD38 sequence. Функция только читает ECSD erase-поля
+для display: `ERASE_GROUP_DEF[175]`, `ERASE_GRP_SIZE`, `ERASE_GRP_MULT`,
+`SEC_ERASE_MULT`, `ERASE_TIMEOUT_MULT`. Реальный "erase" = просто
+**CMD25 WRITE_MULTIPLE_BLOCK с zero (или 0xFF) pattern**.
+
+Для нашего ПО: write-before-erase **не нужен как отдельный шаг**.
+UI-опция "Erase before programming" в Xgpro = zero-fill через CMD25.
+
+### 26.2 Sub-op `0x5E` под top-op `0x08` — CMD30 wrapper
+
+`FUN_00492aa0` (helper из erase path) строит Format B команду с
+sub-op `0x5E` и length=4. При ошибке выводит "Write device Error CMD30
+request!". JEDEC CMD30 `SEND_WRITE_PROT` возвращает 32-бит карту
+write-protect для группы.
+
+| Format | Top-op | Sub-op | Length | Назначение            |
+|--------|--------|--------|--------|-----------------------|
+| B      | `0x08` | `0x5E` | 4 B    | CMD30 SEND_WRITE_PROT |
+
+### 26.3 Variant letter encoding — ASCII high byte `variant`
+
+`FUN_004e18d0` (pin-fault mask selector для eMMC) использует
+`DAT_007a39a9` — **high byte variant**, интерпретируемый как ASCII:
+
+| Буква  | Hex   | Bus mode  | Adapter type | `.alg` семейство |
+|:------:|:-----:|-----------|--------------|------------------|
+| `A`    | 0x41  | 1-bit     | ISP          | `EMMC_41_…`      |
+| `D`    | 0x44  | 4-bit     | ISP          | `EMMC_44_…`      |
+| `Q`    | 0x51  | 1-bit     | BGA socket   | `EMMC_51_…`      |
+| `S`    | 0x53  | 8-bit     | BGA socket   | `EMMC_53_…`      |
+| `T`    | 0x54  | 4-bit     | BGA socket   | `EMMC_54_…`      |
+
+Эти буквы управляют:
+- именованием `.alg` файлов (`EMMC_<hex>_{18,33}.alg`)
+- **expected-pin bitmask** возвращаемым `FUN_004e18d0` (диагностика
+  знает какие пины должны быть live для конкретной variant)
+
+Bitmask значения (`0x0AB8A3FE`, `0x0AB8A1E0`, …) кодируют какие T48 pin
+lines routed к какому eMMC ball для этой variant. Полезно при
+диагностике «Bad Pin On ISP».
+
+### 26.4 Финальные нерешённые опкоды
+
+Без живого железа пока не закроем:
+- Sub-op `0x5C` (1 call site, без anchor строк, low priority).
+- Точные bit-позиции в 32-байтном REQUEST_STATUS reply для individual
+  pin-fault флагов — функции выбирают *expected* mask, но *фактическое*
+  per-pin reading нужно сравнить с USB-дампом.
+- Полная 64-байтная карта BEGIN_TRANSACTION для не-eMMC веток.
+
+Эти задачи решатся когда приедет железо и снимем USB-дамп.
+
 ### 24.1 Two-step «Program Key»
 
 ```

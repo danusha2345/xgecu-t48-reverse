@@ -1603,3 +1603,74 @@ byte 0: error code (see §25.2 table)
 byte 1: ?
 byte 4..8: 32-bit eMMC CARD STATUS register (LE)
 ```
+
+---
+
+## 26. Final reverse pass — erase semantics, variant letters, sub-op 0x5E
+
+### 26.1 Xgpro does *not* use JEDEC CMD35/36/38 for eMMC erase
+
+`FUN_0049e010` ("Erase Partition" function, 1353 decompiled lines) was
+expected to contain a `CMD35 → CMD36 → CMD38` sequence. It does not.
+The function reads ECSD erase-related fields for display only:
+`ERASE_GROUP_DEF[175]`, `ERASE_GRP_SIZE`, `ERASE_GRP_MULT`,
+`SEC_ERASE_MULT`, `ERASE_TIMEOUT_MULT`. The actual "erase" is just
+`CMD25 WRITE_MULTIPLE_BLOCK` with a zero (or 0xFF) pattern.
+
+So **for our own software, write-before-erase isn't a separate step**:
+just program the desired pattern with `bulk_write()`. Xgpro's UI option
+"Erase before programming" is effectively a zero-fill via CMD25.
+
+### 26.2 Sub-op `0x5E` under top-op `0x08` — CMD30 wrapper
+
+`FUN_00492aa0` (the helper that's called from the erase path) builds a
+Format B command with sub-op `0x5E` and length=4, and on failure prints
+"Write device Error CMD30 request!". JEDEC eMMC `CMD30 SEND_WRITE_PROT`
+returns a 32-bit write-protection bitmap for a given group. So:
+
+| Format | Top-op | Sub-op | Length | Meaning             |
+|--------|--------|--------|--------|---------------------|
+| B      | `0x08` | `0x5E` | 4 B    | CMD30 SEND_WRITE_PROT |
+
+The arg holds the LBA of the group being checked, and the 4-byte
+response on EP2 IN is the JEDEC group-write-protection register.
+
+### 26.3 Variant letter encoding — ASCII high byte of `variant`
+
+`FUN_004e18d0` (the eMMC pin-fault mask selector) keys off
+`DAT_007a39a9`, which is the **high byte of the chip's `variant` field**
+in the database, interpreted as an ASCII character:
+
+| Letter | Hex   | Bus mode             | Adapter type      | `.alg` family |
+|:------:|:-----:|----------------------|-------------------|---------------|
+| `A`    | 0x41  | 1-bit                | ISP               | `EMMC_41_…`   |
+| `D`    | 0x44  | 4-bit                | ISP               | `EMMC_44_…`   |
+| `Q`    | 0x51  | 1-bit                | BGA socket        | `EMMC_51_…`   |
+| `S`    | 0x53  | 8-bit                | BGA socket        | `EMMC_53_…`   |
+| `T`    | 0x54  | 4-bit                | BGA socket        | `EMMC_54_…`   |
+
+These letters drive:
+- the `.alg` file naming (`EMMC_<hex>_{18,33}.alg`)
+- the **expected-pin bitmask** returned by `FUN_004e18d0` (so the
+  diagnostic code knows which pins should be live before complaining
+  about which ones are missing)
+
+The bitmasks themselves (32-bit values like `0x0AB8A3FE`, `0x0AB8A1E0`,
+…) encode which of the T48's pin lines are routed to which eMMC ball
+for that variant. Useful for our software when diagnosing "Bad Pin On
+ISP" reports.
+
+### 26.4 Final unknown opcodes left
+
+Still TBD without further effort:
+- Sub-op `0x5C` (1 call site, no anchor strings, low priority).
+- Exact bit positions inside the 32-byte REQUEST_STATUS reply that
+  encode individual pin-fault flags — `FUN_004dc6d0` and its eMMC
+  cousin `FUN_004e18d0` only choose the *expected* mask; the *actual*
+  per-pin reading still needs comparison with a USB capture.
+- The full 64-byte BEGIN_TRANSACTION map for the non-eMMC branches
+  (we have eMMC bytes 0..0x18 plus 0x18..0x40 inferred; the
+  classic-chip branches use different field slots).
+
+These remaining items are best resolved against a USB capture from
+the real hardware once it arrives.

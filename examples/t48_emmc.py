@@ -113,6 +113,18 @@ XGPRO_STATUS_TIMEOUT_EE    = 0xEE
 class LongRecvSubOp:
     """Sub-opcode = byte[1] under top-opcode 0x08."""
     READ_BLOCK_512 = 0x48     # CMD8 SEND_EXT_CSD / CMD17 READ_SINGLE_BLOCK
+    SEND_WRITE_PROT = 0x5E    # CMD30 SEND_WRITE_PROT (4-byte reply)
+
+
+# ASCII variant-letter map (high byte of variant) → algorithm class.
+# Source: FUN_004e18d0 (eMMC pin-fault mask selector).
+VARIANT_LETTER = {
+    'A': (0x41, "ISP", 1),   # ISP 1-bit
+    'D': (0x44, "ISP", 4),   # ISP 4-bit
+    'Q': (0x51, "BGA", 1),   # BGA socket 1-bit
+    'S': (0x53, "BGA", 8),   # BGA socket 8-bit
+    'T': (0x54, "BGA", 4),   # BGA socket 4-bit
+}
 
 
 # ============================================================
