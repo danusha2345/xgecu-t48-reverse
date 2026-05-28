@@ -53,9 +53,9 @@ EP2_IN  = 0x82    # bulk-read responses for eMMC and VGA (Format B and some D pa
 # ============================================================
 class TopOp:
     """Top-opcode = byte[0] of any EP1 command packet."""
-    # Classic (from minipro/src/t48.c)
+    # Classic (from minipro/src/t48.c) — also used by Xgpro for eMMC
     NAND_INIT       = 0x02
-    BEGIN_TRANS     = 0x03
+    BEGIN_TRANS     = 0x03    # 64-byte init+pin-check packet for eMMC too
     END_TRANS       = 0x04
     READID          = 0x05    # identify; also used by Xgpro eMMC init
     READ_USER       = 0x06    # config zone; also used by Xgpro eMMC init
@@ -294,12 +294,92 @@ class T48Emmc:
         self.ep1_send(pack_cmd_A(EmmcSubOp.STOP_AND_STATUS, 0))
         return self.ep1_recv(8)
 
+    # ---- session start: BEGIN_TRANSACTION + pin check + OVC check ----
+    def begin_transaction(self, packet64: bytes) -> bytes:
+        """
+        Send the 64-byte BEGIN_TRANSACTION setup packet on EP1 OUT.
+        Caller is responsible for building the packet from the chip-DB
+        parameters that Xgpro stores in DAT_007a39xx globals (loaded in
+        Xgpro by FUN_004edaa0 when a chip is selected).
+
+        Packet layout (recovered from FUN_00444bc0):
+            byte 0     : 0x03  (top-opcode BEGIN_TRANS)
+            byte 1     : protocol_id (0x31 for eMMC)
+            byte 2     : variant low byte  (= chip_db.variant & 0xFF)
+            byte 3     : icsp / extra flags  (DAT_007a3ba6)
+            byte 4..6  : data_memory_size (LE)
+            byte 6     : pin_map / chip_info (= DAT_007a39b4)
+            byte 7     : DAT_007a397b (extra flags byte)
+            byte 8..10 : DAT_007a39ac (ushort)
+            byte 10..12: DAT_007a39c0 (ushort)
+            byte 12..14: DAT_007a39c4 (ushort)
+            byte 14..16: DAT_007a39b0 (ushort)
+            byte 16..20: code_memory_size (LE)
+            byte 20..24: encoded voltages
+            ... 64 bytes total, remaining mostly chip-specific
+        """
+        assert len(packet64) == 64
+        self.ep1_send(packet64)
+        # No immediate reply; status is fetched via REQUEST_STATUS afterwards.
+        return b''
+
+    def request_status(self) -> bytes:
+        """
+        Send REQUEST_STATUS (top-opcode 0x39) and receive 32-byte reply.
+
+        Reply layout (Ghidra-verified in FUN_00444bc0, line 188+ and
+        matches minipro's t48_get_ovc_status):
+            byte 0     : error code
+            byte 2..4  : c1 counter (LE u16)
+            byte 4..6  : c2 counter (LE u16)
+            byte 8..12 : verify-write address (LE u32)
+            byte 12    : OVC status (bit 0 = overcurrent)
+        """
+        pkt = struct.pack('<BB6x', 0x39, 0)
+        self.ep1_send(pkt)
+        return self.ep1_recv(0x20)
+
+    def check_ovc(self) -> bool:
+        """
+        Returns True if the overcurrent protection has tripped.
+        Convention follows Xgpro's check `(reply[12] & 1) != 0` after
+        sending BEGIN_TRANSACTION.
+        """
+        reply = self.request_status()
+        return (reply[12] & 0x01) != 0
+
+    def end_transaction(self, error_flag: int = 0) -> None:
+        """
+        Send END_TRANSACTION (top-opcode 0x04) to release the session.
+        Xgpro sends byte 1 = 0x01 when terminating due to an OVC event.
+        """
+        self.ep1_send(struct.pack('<BB6x', 0x04, error_flag & 0xFF))
+
+    def begin_session_with_ovc_check(self, packet64: bytes) -> dict:
+        """
+        Convenience wrapper used by Xgpro's pin_detect_pass routine
+        (FUN_00444bc0): BEGIN_TRANS → REQUEST_STATUS → if OVC then
+        END_TRANS(1) and report error.
+
+        Returns {'ovc': bool, 'status': raw 32-byte reply,
+                 'success': bool}.
+        """
+        self.begin_transaction(packet64)
+        status = self.request_status()
+        ovc = (status[12] & 0x01) != 0
+        if ovc:
+            self.end_transaction(error_flag=0x01)
+        return {'ovc': ovc, 'status': status, 'success': not ovc}
+
     # ---- init (no BEGIN_TRANSACTION needed for eMMC!) ----
     def init_emmc(self, algo_param: int, readid_param: int = 0) -> dict:
         """
-        eMMC start-up: opcode 0x21 → 0x05 → 0x06. This subsumes
-        BEGIN_TRANSACTION for the eMMC path (the main Xgpro dispatcher
-        never sends opcode 0x03 for eMMC).
+        eMMC chip-level init: opcode 0x21 → 0x05 → 0x06.
+
+        IMPORTANT (revised after deeper Ghidra reverse): this is the
+        eMMC chip-side initialization (CMD0/1/2/3 sequence). It runs
+        AFTER begin_session_with_ovc_check() has done the programmer-side
+        BEGIN_TRANSACTION (top-op 0x03, 64 bytes) and pin/OVC check.
 
         Returns a dict with parsed OCR / CID / CSD bytes.
 

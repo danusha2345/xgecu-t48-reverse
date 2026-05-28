@@ -704,3 +704,126 @@ WinUsb_SetPipePolicy(handle, 0x83, PIPE_TRANSFER_TIMEOUT, 4, &timeout_ms);
 программатора и выбираются opcode `0x21`).
 
 ---
+
+## 20. Напряжения, OVC (защита от перегрузки), pin detect
+
+### 20.1 Поправка: `BEGIN_TRANSACTION` для eMMC **используется**
+
+В §19.13 я ошибся: смотрел только верхнеуровневый dispatcher `FUN_004c9110`,
+а 64-байтный `BEGIN_TRANSACTION` пакет отправляется на уровень ниже —
+в `FUN_00444bc0` (`pin_detect_pass`), который вызывается перед каждой
+eMMC-операцией.
+
+Правильная картина:
+
+```
+1. UI «выбор чипа»:
+     FUN_004edaa0 копирует поля чипа из БД (Ic_100) в глобалы
+     DAT_007a39xx (protocol_id, variant, voltages, sizes, …)
+
+2. Старт операции (Read/Write/Verify…):
+     FUN_00444bc0 (pin_detect_pass):
+       a. Собрать 64-байт BEGIN_TRANS пакет из глобалов
+       b. raw_send(handle, packet, 0x40)              ← EP1 OUT
+       c. raw_send(handle, [0x39,0,0,0,0,0,0,0], 8)   ← REQUEST_STATUS
+       d. raw_recv(handle, status, 0x20)
+       e. if (status[12] & 0x01) {                    ← OVC сработал!
+            показать "OverCurrent Protection !"
+            raw_send([0x04,0x01,0,…], 8)              ← END_TRANS
+            MessageBeep; abort.
+          }
+
+3. Дальше — eMMC-инит (opcode 0x21, …)
+```
+
+### 20.2 Layout 64-байтного `BEGIN_TRANSACTION` для eMMC
+
+Поля собираются из глобалов `DAT_007a39xx`, которые `FUN_004edaa0`
+заполняет из БД-записи `Ic_100` для выбранного чипа. Сокращённая карта
+(для eMMC ветки `DAT_007a3978 == 0x31`):
+
+| Pkt offset | Источник              | Поле БД                    | Назначение         |
+|-----------:|-----------------------|----------------------------|--------------------|
+| `0x00`     | литерал `0x03`        | —                          | top-op BEGIN_TRANS |
+| `0x01`     | `DAT_007a3978`        | `protocol_id` (off 0)      | `0x31` для eMMC    |
+| `0x02`     | `DAT_007a39a8`        | `variant` low (off 0x34)   | вариант алгоритма  |
+| `0x03`     | `DAT_007a3ba6`        | (extra)                    | флаги режима       |
+| `0x04..6`  | `DAT_007a39ac` (u16)  | data_memory_size           |                    |
+| `0x06`     | `DAT_007a39b4`        | (off 0x44)                 | pin_map/chip_info  |
+| `0x10..14` | `DAT_007a397c` (u32)  | code_memory_size (off 0x38)|                    |
+| `0x14..18` | mixed                 | voltage encoding           |                    |
+| …          | …                     | …                          | другие chip params |
+
+Все поля доступны из дампа `emmc_chips_t48.json` — пакет полностью
+собираем оффлайн для любого из 4 796 чипов.
+
+### 20.3 Конфигурация напряжения
+
+Для eMMC напряжение **прошито в BEGIN_TRANSACTION** — отдельной команды
+SET_VCC_VOLTAGE не требуется. UI Xgpro предлагает три дискретных VCCQ
+(всегда с VCC=3.0V):
+
+```
+"VCC=3.0V VCCQ=1.2V"
+"VCC=3.0V VCCQ=1.8V"  ← типовой для современных eMMC
+"VCC=3.0V VCCQ=3.0V"
+```
+
+И fine-trim: `VCCQ + 0.0V / +0.1V / +0.2V / +0.3V`.
+
+Выбор `VCCQ` идёт через **выбор `variant` чипа в БД** перед отправкой
+BEGIN_TRANS. Например `variant = 0x4100` → ISP 1-bit, 1.8В;
+`variant = 0x4133` → ISP 1-bit, 3.3В (`0x33` = `'3'`).
+
+Для классических чипов используется отдельный opcode `0x1B`
+(`SET_VCC_VOLTAGE`) — см. minipro `t48_set_vcc_voltage()`.
+
+### 20.4 Overcurrent protection (OVC)
+
+Точное соответствие с minipro `t48_get_ovc_status`:
+
+| Шаг | Байты (LE)                  | Смысл                                         |
+|-----|------------------------------|-----------------------------------------------|
+| 1   | `39 00 00 00 00 00 00 00`   | send `REQUEST_STATUS` (8 байт EP1 OUT)        |
+| 2   | recv 32 байт EP1 IN          | status block                                  |
+| 3   | `reply[12] & 0x01`           | флаг OVC (1 = сработал, 0 = OK)               |
+
+Другие поля 32-байтного status reply:
+- `reply[0]` — error code последней операции
+- `reply[2..4]` — counter `c1` (LE u16)
+- `reply[4..6]` — counter `c2` (LE u16)
+- `reply[8..12]` — verify-write address (LE u32)
+- `reply[12]` — **OVC байт**
+
+При срабатывании OVC Xgpro шлёт END_TRANS с byte 1 = 0x01:
+```
+04 01 00 00 00 00 00 00
+```
+и показывает «OverCurrent Protection !» + системный beep.
+
+### 20.5 Pin detect
+
+Pin detect выполняется **в том же `FUN_00444bc0`** — отдельной команды
+(как minipro `READ_PINS = 0x35`) нет. Информация о направлении пинов /
+pull-ups уже закодирована в самом BEGIN_TRANS пакете (из
+`pin_map`/`package_details`). Результат приходит в тех же 32 байтах
+status reply вместе с OVC.
+
+Строки UI:
+- `"Pin Detected Passed."` — всё ОК
+- `"Pin Detected ERROR!"` / `"Bad PINs Connection."` — pin не подключён
+- `"Pin Detect error!/ Direction"` — направление пина неверное
+
+Конкретные биты в reply для pin-flags — TBD (нужен USB-дамп для
+точного маппинга). Но OVC и pin live в одной 32-байтовой структуре.
+
+### 20.6 Таймауты пайпов
+
+`FUN_004dbd00` (см. §19.12) ставит `PIPE_TRANSFER_TIMEOUT` на
+`0x81/0x82/0x83` перед длинными операциями. Xgpro использует:
+- 5 000 мс для EXT_CSD read
+- 50 000 мс для обычных read'ов
+
+Всегда устанавливай таймаут перед длинной сессией.
+
+---

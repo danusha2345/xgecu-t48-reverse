@@ -847,3 +847,159 @@ protocol used by the **VGA** path (chip_type 8), and possibly by other
 
 This opcode is **not** used by the eMMC paths (eMMC algorithms are stored
 on the programmer board and selected with opcode `0x21`).
+
+---
+
+## 20. Voltage, overcurrent protection, pin detection
+
+### 20.1 Correction: `BEGIN_TRANSACTION` *is* used for eMMC
+
+In §19.13 I claimed `BEGIN_TRANSACTION` (top-opcode `0x03`) is never sent
+for the eMMC path. That conclusion was wrong: I had only inspected the
+top-level dispatcher `FUN_004c9110`. The 64-byte `BEGIN_TRANSACTION`
+packet is sent one level down, inside `FUN_00444bc0` (`pin_detect_pass`),
+which is called from the dispatcher early in every eMMC operation.
+
+So the correct picture for an eMMC session is:
+
+```
+1. user-level "select chip" UI:
+     FUN_004edaa0 copies the chip-DB record (Ic_100) into globals
+     DAT_007a39xx (protocol_id, variant, voltages, sizes, …)
+2. operation start (Read / Write / Verify / etc.):
+     FUN_00444bc0 (pin_detect_pass) is entered first:
+       a. assemble the 64-byte BEGIN_TRANSACTION packet from globals
+       b. raw_send(handle, packet, 0x40)                  ← EP1 OUT
+       c. raw_send(handle, [0x39,0,0,0,0,0,0,0], 8)        ← REQUEST_STATUS
+       d. raw_recv(handle, status_buf, 0x20)
+       e. if (status_buf[12] & 0x01) {                    ← OVC tripped
+            display "OverCurrent Protection !"
+            raw_send(handle, [0x04,0x01,0,…], 8)          ← END_TRANS
+            MessageBeep; abort.
+          }
+3. continue with the actual eMMC flow (opcode 0x21 init, …)
+```
+
+### 20.2 64-byte `BEGIN_TRANSACTION` packet layout for eMMC
+
+The bytes are assembled in `FUN_00444bc0` from the global block
+`DAT_007a39xx`, which `FUN_004edaa0` had populated from the chip's
+`Ic_100` database record. The mapping (recovered from the
+decompilation; offsets in the database record taken from the dumper
+in `minipro/dumpic/dump-infoic2plus-dll.c`):
+
+| Pkt offset | Source (`DAT_007a…`) | Source in `Ic_100`     | Field meaning              |
+|-----------:|----------------------|------------------------|----------------------------|
+| `0x00`     | (literal `0x03`)     | —                      | top-opcode `BEGIN_TRANS`   |
+| `0x01`     | `DAT_007a3978`       | `protocol_id` (off 0)  | `0x31` for eMMC            |
+| `0x02`     | `DAT_007a39a8`       | `variant` low (off 0x34)| algorithm variant low byte |
+| `0x03`     | `DAT_007a3ba6`       | (extra flags)          | per-mode flags             |
+| `0x04..6`  | `DAT_007a39ac` (u16) | (off 0x3c)             | data_memory_size           |
+| `0x06`     | `DAT_007a39b4`       | (off 0x44)             | pin_map / chip_info        |
+| `0x07`     | `DAT_007a397b`       | (off 4)                | extra flags                |
+| `0x08..a`  | `DAT_007a39ac` (u16) | data_memory_size       | (also at 0x04 — Xgpro quirk)|
+| `0x0a..c`  | `DAT_007a39c0` (u16) | (off 0x54)             | data_memory2_size          |
+| `0x0c..e`  | `DAT_007a39c4` (u16) | (off 0x58)             | page_size                  |
+| `0x0e..10` | `DAT_007a39b0` (u16) | (off 0x40)             | pulse_delay                |
+| `0x10..14` | `DAT_007a397c` (u32) | `code_memory_size` (0x38) | code_memory_size        |
+| `0x14..18` | mixed (per chip_type) | voltage encoding      | raw_voltages / variant     |
+| `0x18..1c` | `DAT_00904e88` (u32) | (UI / mode globals)    | mode flags                 |
+| `0x1c..20` | `DAT_00904e8c` (u32) |                        | mode flags                 |
+| `0x20..24` | `DAT_00904e90` (u32) |                        | mode flags                 |
+| `0x24..28` | `DAT_00904e94`        | or `DAT_0080187b` (eMMC ver. 0x05) | algorithm sub-mode |
+| `0x28..2c` | `DAT_007a39d4` (u32) |                        |                            |
+| `0x2c..30` | `DAT_007a39b6` (u32) |                        |                            |
+| `0x30..32` | `DAT_007a3ba4` (u16) |                        |                            |
+| `0x32..34` | `DAT_007a39be` (u16) |                        |                            |
+| `0x34..38` | `DAT_007a39d0` (i32) |                        |                            |
+| `0x38..3c` | `DAT_007a39d8` (u32) |                        |                            |
+| `0x3c..3f` | 0                    |                        | padding                    |
+| `0x3f`     | `DAT_007a39a9`       |                        |                            |
+
+The mapping isn't 100% literal because `FUN_00444bc0` has many `if`
+branches by `DAT_007a3978` (chip_type) that swap some fields. The
+table above is the **eMMC (`0x31`) branch**. Practical implication
+for our prototype: every field above is reachable from the dumped
+`emmc_chips_t48.json`, so the packet can be assembled offline for any
+of the 4 796 chips.
+
+### 20.3 Voltage configuration
+
+For eMMC, the voltage is baked into the `BEGIN_TRANSACTION` packet — the
+programmer doesn't take a separate `SET_VCC_VOLTAGE` command. The
+relevant Xgpro UI strings show **three discrete VCCQ choices**, all
+combined with a fixed `VCC = 3.0 V`:
+
+```
+"VCC=3.0V VCCQ=1.2V"
+"VCC=3.0V VCCQ=1.8V"
+"VCC=3.0V VCCQ=3.0V"
+```
+
+Plus a fine-trim:
+```
+"VCCQ + 0.0V" / "VCCQ + 0.1V" / "VCCQ + 0.2V" / "VCCQ + 0.3V"
+```
+
+These choices feed into the `variant` of the chip selected in the UI
+(low byte of `variant` → pkt byte `0x02`). For example
+`variant = 0x4100` → ISP 1-bit / 1.8 V; `variant = 0x4133` → ISP 1-bit / 3.3 V
+(`0x33` = `'3'`, ASCII for the voltage suffix in our `.alg` file naming).
+
+So **switching `VCCQ` is a matter of picking the right chip variant in the
+database before issuing `BEGIN_TRANSACTION`** — no explicit voltage opcode
+is needed for eMMC. (For classic chips the `SET_VCC_VOLTAGE` opcode
+`0x1B` and `SET_VPP_VOLTAGE` `0x1C` *are* used; minipro's
+`t48_set_vcc_voltage()` is the reference.)
+
+### 20.4 Overcurrent protection (OVC)
+
+Match between minipro `t48_get_ovc_status` and Xgpro `FUN_00444bc0`:
+
+| Step | Bytes (LE)                  | Meaning                                       |
+|------|-----------------------------|-----------------------------------------------|
+| 1    | `39 00 00 00 00 00 00 00`   | send `REQUEST_STATUS` (8 bytes EP1 OUT)       |
+| 2    | recv 32 bytes EP1 IN        | status block                                  |
+| 3    | `reply[12] & 0x01`          | overcurrent flag (1 = tripped, 0 = OK)        |
+
+Other useful fields in the 32-byte status reply (minipro mapping):
+- `reply[0]` — error code (last operation)
+- `reply[2..4]` — counter `c1` (LE u16)
+- `reply[4..6]` — counter `c2` (LE u16)
+- `reply[8..12]` — verify-write address (LE u32)
+- `reply[12]` — OVC byte
+
+On OVC trip, Xgpro sends an END_TRANSACTION with byte 1 = 0x01:
+```
+04 01 00 00 00 00 00 00
+```
+and shows "OverCurrent Protection !" + a system beep.
+
+### 20.5 Pin detection / "Bad Pins Connection"
+
+Pin detection is **part of the same `FUN_00444bc0` flow** — there is no
+separate "pin test" opcode like minipro's `T48_READ_PINS = 0x35`. The
+`BEGIN_TRANSACTION` packet itself contains pin-direction / pull-up /
+pull-down information (it was assembled from chip-specific
+`pin_map`/`package_details`), and the programmer reports the result
+through the same status field set as OVC. The strings
+`"Pin Detected ERROR!"`, `"Pin Detected Passed."`,
+`"Bad PINs Connection."` are formatted from the 32-byte status reply,
+but the exact bits we still need to confirm with a USB capture.
+
+For our purpose the practical algorithm is:
+
+```python
+emmc.begin_session_with_ovc_check(packet64)   # uses BEGIN_TRANS + REQUEST_STATUS
+if result['ovc']:
+    abort("OverCurrent: bad connection or short")
+# pin-status bits live elsewhere in the 32-byte reply; TBD bit positions
+# but we already have the bytes — diffing OK-vs-bad-pin captures will fix
+# the mapping.
+```
+
+### 20.6 Pipe transfer timeouts
+
+`FUN_004dbd00` (§19.12) configures `PIPE_TRANSFER_TIMEOUT` on `0x81 / 0x82 / 0x83`
+before long operations (eMMC EXT_CSD read uses 5 000 ms timeout, normal
+reads use 50 000 ms). Always set this before a long-running session.
