@@ -44,7 +44,7 @@ From analysis of `Xgpro.exe` (call sites of `WinUsb_WritePipe` /
 |------|-----------|-------------------------------|--------------------------------------|
 | EP1  | OUT / IN  | commands, config, status      | 8 or 16 bytes (fixed structures)     |
 | EP2  | OUT       | bulk eMMC data (write side)   | `N × 512` bytes (sector-aligned)     |
-| EP2  | IN        | not observed in Xgpro's flows |                                      |
+| EP2  | IN        | bulk read-back (classic `READ_CODE` + eMMC) — see §32 | 64 B / N×512 B               |
 
 Call-site counts in the binary: `WinUsb_WritePipe` = 36 distinct call
 sites, `WinUsb_ReadPipe` = 70, `WinUsb_Initialize` = 1.
@@ -2330,3 +2330,71 @@ programming voltage) reproduced the wire formats above and added:
 All four endpoints, the identify record, and these read-backs are
 reproducible from Linux via libusb with no udev rule on this host (the
 device node already carries a uaccess ACL).
+
+## 32. Classic-chip read / erase / write — full cycle validated from Linux
+
+The first **end-to-end read *and* write** of a real chip, both captured
+from Xgpro and **reproduced byte-for-byte by our pyusb prototype on
+Linux**. Target: a **93LC56** (3-wire Microwire EEPROM, 256 bytes) — the
+configuration EEPROM of an **FT2232 board**, read/written **in-circuit**
+through the ICSP port (`ICSP_VCC Enable`). Content seen: FTDI
+`VID 0x0403 / PID 0x6010`, strings `"USB <-> Serial Converter"` etc.
+
+### 32.1 Session framing — `BEGIN_TRANSACTION` on a real chip (validates §30)
+
+```
+03 02 8b 81 00 00 00 6c  00 00 00 00 0a 00 00 00
+00 01 00 00 00 00 00 00  ... (64 bytes)
+```
+- `byte[0x01] = 0x02` → protocol_id for the 93-series.
+- `byte[0x02..03] = 8b 81` → chip variant.
+- `byte[0x10] (u32 LE) = 0x00000100 = 256` → **`code_memory_size` = the
+  chip size**, exactly the §30 field map. First real-chip confirmation.
+
+`REQUEST_STATUS` (`0x39`) is issued before/after each phase: 32-byte
+reply, **OVC at byte[12]** (all-clear here).
+
+### 32.2 `READ_CODE` (`0x0D`) — read side, EP2 IN
+
+```
+EP1 OUT (8):  0d 01 40 00 [word_addr LE32]      ; 0x40 = 64-byte chunk
+EP2 IN (64):  <data>
+```
+Four calls at word-addr `0x00 / 0x20 / 0x40 / 0x60` → 256 bytes. Data
+comes back on **EP2 IN (`0x82`)**.
+
+### 32.3 `ERASE` (`0x0E`) + `WRITE_CODE` (`0x0C`) — the program cycle, EP2 OUT
+
+Xgpro's full *program* is **read → erase → write → verify-read**:
+
+```
+ERASE:        EP1 OUT (8):  0e 00 01 00 00 00 00 00
+WRITE_CODE:   EP1 OUT (8):  0c 01 20 00 [word_addr LE32]   ; 0x20 = 32-byte chunk
+              EP2 OUT (32): <payload>
+```
+Eight write chunks at word-addr `0x00 / 0x10 / … / 0x70` → 256 bytes.
+**Note the asymmetry:** writes use **32-byte** chunks (`byte[2]=0x20`),
+reads use **64-byte** chunks (`byte[2]=0x40`). Write payload goes on
+**EP2 OUT (`0x02`)**.
+
+### 32.4 EP2 is bidirectional for classic chips too (corrects §2)
+
+`§2` originally read "EP2 IN: not observed". This capture disproves that
+for the **classic** path as well (it was already known for eMMC, §19.4):
+**EP2 IN = bulk read-back, EP2 OUT = bulk write payload**, for ordinary
+`READ_CODE`/`WRITE_CODE` — not just eMMC.
+
+### 32.5 Reproduced from Linux
+
+Our prototype (`examples/t48_emmc.py` low-level `ep1_send`/`ep1_recv`/
+`ep2_send`/`ep2_recv`) replayed all of it against the live device:
+
+1. **Read** — 256 bytes identical to Xgpro's capture (FTDI VID/PID + strings).
+2. **Write** — wrote a marker chunk, read it back unchanged.
+3. **Restore** — ran the captured canonical cycle (`ERASE` + eight 32-byte
+   `WRITE_CODE`) to put the original FTDI image back; verify-read returned
+   **byte-for-byte the golden image** (OVC clear throughout).
+
+This is the first confirmation that the reverse-engineered classic
+transport supports a **complete read-modify-write-verify cycle from
+Linux**, matching first-party Xgpro on the wire.
