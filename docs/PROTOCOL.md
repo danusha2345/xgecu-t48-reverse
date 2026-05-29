@@ -2530,3 +2530,69 @@ in these ISP reads the DB `variant` bytes `[0x02..03]` are `00 00`, and
 the live selector is `0x51`/`0x54`. The 1-bit read is also ~1.6× slower
 on the wire (61 s vs 37 s; ~100 MB vs ~150 MB on EP2 IN), as expected for
 the narrower bus.
+
+## 34. eMMC-ISP write — erase → program → verify (captured)
+
+A captured **1-bit eMMC write to the user area** (same chip/adapter as
+§33) completes the round-trip: it shows how the eMMC *program* path
+works, which is **structurally different from the read** path.
+
+Init is identical (§33.2): `0x24` adapter (`XGecu Directly`) → `0x3E` →
+`0x03` BEGIN (`protocol_id=0x31`, bus-width `0x51`) → `0x21`/`0x05`/`0x06`/
+`0x08·0x48` → SWITCH `→USER` (`27 46 00 00 00 07 b3 02`). One tell: the
+write `BEGIN` has **`byte[0x18] = 0x04`** where the read had `0x03` — a
+likely read/write mode marker.
+
+### 34.1 ERASE phase — `0x0E` + `0x27/0x4D`, in 512 KB groups
+
+The target region is erased first, as **32 iterations** of:
+
+```
+EP1 OUT:  27 4d 01 00 00 00 00 01 00          ; 0x27 sub-op 0x4D (erase-group setup)
+EP1 OUT:  0e 00 00 00 [start_blk LE32] ff [end_lo] 00 00 00 00 00 00
+EP1 IN :  0e 00 00 00 80 80 ff c0             ; OCR-like ack
+```
+`start_blk` steps by `0x400` (1024 blocks) — `0, 0x400, 0x800, …` — and the
+`ff XX` field is the matching erase-group end marker
+(`ff03, ff07, ff0b, …`). **32 × 1024 blocks × 512 B = exactly 16 MB**
+erased, matching the intended write size. So `0x0E` carries `(start, end)`
+block addresses (not the classic 1-shot `0e 00 01 …` form of §32), and
+`0x27/0x4D` is the per-group companion (resolves the §25 "`0x4D` =
+commit/finalize?" question — it is the **erase-group step**).
+
+### 34.2 WRITE phase — `0x1F` setup + payload on EP2 OUT
+
+eMMC writes do **not** use the read's `0x14`/`0x15` pairs. Instead a new
+opcode **`0x1F`** carries a 40-byte descriptor (the write-side mirror of
+the `0x0D` read descriptor):
+
+```
+1f 01 00 00 | [addr] | 00 02 00 00 | 20 00 00 00 | [count] |
+20 00 00 00 | 20 00 00 00 | 04 00 00 00 | 01 00 00 00 | 00 00 00 00
+```
+(note the `04 00 00 00` field where the `0x0D` read had `01 00 00 00`).
+The payload then streams on **EP2 OUT (`0x02`)** in **16 KB chunks**
+(16400-byte transfers = 16384 data + 16). ~8.6 MB streamed here — the
+erase covered the full 16 MB but only ~8.6 MB of payload went over the
+wire (Xgpro most likely **skips blank/0xFF pages**; exact policy TBD).
+
+### 34.3 VERIFY phase
+
+After programming, Xgpro reads the region back with the §33.4 read path
+(`0x0D` + EP2 IN, ~25 MB including the boot/RPMB walk) and compares — the
+"write + verify" the operation name implies. A single `0x0A` (generic
+eMMC CMD wrapper, §23.1) appears near the end as a final status/CMD.
+
+### 34.4 Summary: read vs write opcodes
+
+| Phase | Read | Write |
+|-------|------|-------|
+| bulk setup | `0x0D` (40 B) | **`0x1F`** (40 B) |
+| bulk data | `0x14`/`0x15` → **EP2 IN** | direct → **EP2 OUT** (16 KB) |
+| erase | — | **`0x0E` (start,end)** + `0x27/0x4D` ×N |
+| `BEGIN[0x18]` | `0x03` | `0x04` |
+
+With this, the eMMC-ISP **read and write** paths are both captured and
+decoded — the protocol side of the project is essentially complete; what
+remains is the adapter's on-device authentication (off-wire) and turning
+these flows into prototype methods.
