@@ -2596,3 +2596,67 @@ With this, the eMMC-ISP **read and write** paths are both captured and
 decoded — the protocol side of the project is essentially complete; what
 remains is the adapter's on-device authentication (off-wire) and turning
 these flows into prototype methods.
+
+## 35. eMMC-ISP read/write implemented & verified from Linux
+
+`examples/t48_emmc_isp.py` replays the §33–§34 flow parameterised by block
+address and **arbitrary read AND write were verified on real hardware from
+Linux** (no Xgpro): a 16 KB pattern written to an arbitrary block reads
+back byte-for-byte and persists across sessions. Implementing it pinned
+down a few details the raw captures only implied.
+
+### 35.1 The read "arm" is a 512-byte RPMB probe
+
+Before the first `0x0D` read, Xgpro does a one-time sequence that the
+prototype must replay or the bulk engine never streams:
+
+```
+SWITCH->RPMB (27 46 00 00 00 03 b3 01)   ; EP1, 8-byte reply
+0x14  (14 00 00 00 00 00 00 00 01 00 00 02 00 00 00 00)   ; EP1
+512 bytes 0x00                            ; EP2 OUT
+0x15  (15 00 00 02 00 00 00 00 01 00 00 02 00 00 00 00)   ; EP1
+512 bytes + 16 bytes                      ; EP2 IN (RPMB response + status)
+SWITCH->USER (27 46 00 00 00 07 b3 02)    ; EP1, 8-byte reply
+```
+
+### 35.2 Exact bulk chunk framing
+
+- **READ** (`0x0D` setup: byte[4..8]=start block, byte[16..20]=chunk count):
+  each 16 KB chunk arrives on EP2 IN as **`[16-byte header + 16368 data]`**
+  followed by a separate **`[16-byte tail]`** — concatenate `header[16:] +
+  tail` to recover the full 16384 data bytes.
+- **WRITE** (`0x1F` setup): payload streams on EP2 OUT as 16 KB chunks, each
+  prefixed by a **16-byte header** `struct <u32 0><u32 block_addr><u16 512>
+  <u16 0><u32 32>`. The per-chunk `block_addr` is how Xgpro skips blank
+  sectors *and* how we address arbitrary blocks.
+- **EXT_CSD** (`0x08`/`0x48`) returns its 512-byte block **and** an 8-byte
+  ack, both on **EP2 IN**.
+
+### 35.3 VCCQ select — `BEGIN[0x15]` (static reverse)
+
+In the eMMC branch of the BEGIN builder `FUN_00444bc0` (`0x444edd`):
+`buffer[0x15] = DAT_007485c8`. Every capture had it `0x00`; the compare
+sites (`0x4953a0`, next to *"50 MHZ (VCCQ=3.3V)"* vs *"AUTO MAX=160MB/s"*,
+and `0x493d61`) treat it as **boolean — 0 = 3.3 V / 50 MHz, nonzero =
+1.8 V / HS200**. So:
+
+| `BEGIN[0x15]` | VCCQ |
+|:---:|---|
+| `0x00` | **3.3 V** (capture-confirmed, read+write verified) |
+| `0x01` | **1.8 V** (static-reverse-derived, **not** hardware-verified) |
+
+`t48_emmc_isp.py --voltage {3.3,1.8}` sets exactly this byte; nothing else
+in BEGIN changes between voltages.
+
+### 35.4 Practical notes
+
+- **Wedging:** any transfer that times out mid-session wedges the
+  programmer's eMMC state machine. `clear_halt` / `usb reset` do **not**
+  recover a hard wedge — only a physical unplug/replug. The prototype's
+  `_recover()` + retry handles transient init hiccups; a hard wedge raises
+  "replug the T48".
+- The adapter handshake (`0x24` → `XGecu Directly`) replays fine from the
+  PC: the crypto is between adapter and firmware, so the host just replays
+  the captured bytes (confirms §28.1 / §33.1).
+- Verified ops at 3.3 V / 1-bit: identify, CID/CSD/EXT_CSD, arbitrary read,
+  arbitrary write, cross-session persistence.

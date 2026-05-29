@@ -129,7 +129,7 @@ class EmmcIsp:
         self.d.ep1_send(SWITCH_USER); self.d.ep1_recv(64)
 
     # ---- arbitrary read (USER partition) ----
-    def read(self, start_block, n_chunks):
+    def _read_once(self, start_block, n_chunks):
         info = self._adapter_and_init(self._begin(BEGIN_READ))
         self._arm_bulk()
         setup = _set_u32(_set_u32(RD_SETUP, 4, start_block), 16, n_chunks)
@@ -145,7 +145,7 @@ class EmmcIsp:
         return info, bytes(data[:n_chunks * CHUNK])
 
     # ---- arbitrary write (USER partition) ----
-    def write(self, start_block, data, erase=False):
+    def _write_once(self, start_block, data, erase=False):
         assert len(data) % CHUNK == 0, "data must be a multiple of 16 KB"
         n_chunks = len(data) // CHUNK
         info = self._adapter_and_init(self._begin(BEGIN_WRITE))
@@ -170,6 +170,71 @@ class EmmcIsp:
         self.d.ep1_send(STATUS); self.d.ep1_recv(64)
         self.d.ep1_send(END)
         return info
+
+    # ---- recovery + retry ----
+    def _recover(self):
+        """Best-effort recovery after a failed transfer. Works for transient
+        init/timeout hiccups; a HARD wedge (aborted mid-bulk) survives this and
+        only a physical replug clears it. Returns True if the programmer pings
+        back (alive)."""
+        for ep in (0x01, 0x81, 0x02, 0x82):
+            try: self.d.dev.clear_halt(ep)
+            except Exception: pass
+        for ep in (0x81, 0x82):              # drain stale IN
+            for _ in range(20):
+                try:
+                    if not self.d.dev.read(ep, 16384, timeout=150): break
+                except Exception: break
+        try: self.d.ep1_send(END)
+        except Exception: pass
+        try:                                  # programmer identify (non-eMMC) = alive check
+            self.d.ep1_send(b"\x00" * 8)
+            return len(self.d.ep1_recv(512)) > 0
+        except Exception:
+            return False
+
+    def _retry(self, fn, attempts=3):
+        last = None
+        for _ in range(attempts):
+            try:
+                return fn()
+            except usb.core.USBError as ex:
+                last = ex
+                if not self._recover():
+                    raise RuntimeError("T48 wedged — physically unplug/replug it") from ex
+        raise last
+
+    def read(self, start_block, n_chunks):
+        return self._retry(lambda: self._read_once(start_block, n_chunks))
+
+    def write(self, start_block, data, erase=False):
+        return self._retry(lambda: self._write_once(start_block, data, erase))
+
+    # ---- friendly region API (arbitrary block offset / length) ----
+    def read_region(self, start_block, n_blocks):
+        """Read n_blocks*512 bytes from start_block (any block, not just
+        16 KB-aligned)."""
+        base = start_block - (start_block % CHUNK_BLOCKS)
+        off = (start_block - base) * BLK
+        n_chunks = (off + n_blocks * BLK + CHUNK - 1) // CHUNK
+        _, data = self.read(base, n_chunks)
+        return data[off:off + n_blocks * BLK]
+
+    def write_region(self, start_block, data, erase=False):
+        """Write `data` starting at start_block (any block/length). Edges that
+        don't fall on a 16 KB chunk are read-modify-written so neighbours are
+        preserved."""
+        base = start_block - (start_block % CHUNK_BLOCKS)
+        off = (start_block - base) * BLK
+        total = off + len(data)
+        n_chunks = (total + CHUNK - 1) // CHUNK
+        if off == 0 and len(data) % CHUNK == 0:
+            buf = bytearray(data)                       # fully aligned: no RMW
+        else:
+            buf = bytearray(self.read(base, n_chunks)[1])   # RMW: fetch covering chunks
+            buf[off:off + len(data)] = data
+            buf += b"\x00" * (n_chunks * CHUNK - len(buf))
+        self.write(base, bytes(buf[:n_chunks * CHUNK]), erase=erase)
 
 
 def _hexdump(b, n=128):
