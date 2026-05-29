@@ -79,6 +79,11 @@ def main() -> int:
             model = info[6]
             name = {0x05: "TL866II+", 0x06: "T56", 0x07: "T48", 0x08: "T76"}.get(model, "?")
             print(f"    model byte[6] = 0x{model:02x} ({name})")
+        # firmware version — Xgpro shows "Ver XX.YY.ZZ" = bytes [0].[1].[4]
+        # decimal (byte[4] is the build number; confirmed against Xgpro UI).
+        if len(info) > 4:
+            print(f"    firmware ver   = {info[0]:02d}.{info[1]:02d}.{info[4]:02d}"
+                  f"   (byte[4]=0x{info[4]:02x}={info[4]} build)")
         # NUL-terminated build date right after the 8-byte header
         build = info[8:].split(b"\x00", 1)[0].decode("latin1", "replace")
         print(f"    firmware build = {build!r}")

@@ -2196,19 +2196,26 @@ arrived (2026-05-29) under first-party Xgpro on Windows:
 - a short **connect / version** capture (20 packets), and
 - a full **System Self-check** capture (1422 packets, 9.1 s).
 
-Device reported itself as: firmware build **`2024-08-15 17:21`**, version
-word **`0x05D1` (1489)**, model T48. Enumeration was **high-speed USB
-2.0 (480 Mbit/s)** with exactly **four bulk endpoints** —
-`0x01`/`0x81` and `0x02`/`0x82`, all `wMaxPacketSize = 512` — which
-**directly confirms the §2 endpoint map** (EP1 short commands, EP2 bulk).
+Device reported itself as: firmware version **`00.01.39`** (see §31.1 for
+how that decodes), build-stamp **`2024-08-15 17:21`**, model T48.
+Enumeration was **high-speed USB 2.0 (480 Mbit/s)** with exactly **four
+bulk endpoints** — `0x01`/`0x81` and `0x02`/`0x82`, all
+`wMaxPacketSize = 512` — which **directly confirms the §2 endpoint map**
+(EP1 short commands, EP2 bulk). Xgpro's own connect log agrees:
+`Device 1: T48 [TL866-3G] Ver: 00.01.39, USB POWER 04.89 V, USB2.0 HS
+480 MHz` (note Xgpro's marketing name **TL866-3G**, vs the USB-ID
+database's "TL866II Plus").
 
 > Note on the firmware capture: it contains **no firmware payload**. A
 > real flash makes the TL866/T48 re-enter a **bootloader that
 > re-enumerates** (possibly under a different identity), so a USBPcap
 > filter locked to `a466:0a53` will not see the flash blocks. To capture
-> an actual update, capture the **whole root hub**, not the device. In
-> this session the device only reported its (already-current) version,
-> so nothing was missed.
+> an actual update, capture the **whole root hub**, not the device. That
+> is exactly what happened here: the operator *did* update the firmware,
+> the version went **`00.01.03` → `00.01.39`** (visible in the `0x00`
+> reply, §31.1), but the flash blocks themselves landed on the
+> bootloader device and are **absent from this `a466:0a53`-filtered
+> capture** — a concrete confirmation of the filtering caveat.
 
 ### 31.1 Identify / version handshake — top-opcode `0x00` (new)
 
@@ -2228,20 +2235,26 @@ dev  → EP1 IN (63):  00 01 30 00 27 01 07 00            ; 8-byte header
   (`DAT_0080109b`: 7 = T48). The same `… 01 07 00` triplet appears in the
   `READ_PINS`/`MEASURE_VOLTAGES` replies below, i.e. **byte[6] of every
   EP1 reply carries the model code**.
-- Header byte `[4]` is **not constant**: `0x03` in the cold-plug firmware
-  capture, `0x27` on every read after the device has done some activity —
-  looks state/mode-dependent, exact meaning TBD.
-- The **firmware build identifier is the timestamp string** (`2024-08-15
-  17:21` here), and it was **unchanged** across all captures.
-- The trailing 16-bit word is **NOT a firmware version** — it is a
-  **live, ADC-like sample**. Read back-to-back three times it returned
-  `0x05E7 / 0x05ED / 0x05E9` (1511 / 1517 / 1513), and `0x05D1` (1489) in
-  the earlier capture: a few counts of jitter around ~1510, i.e. an
-  analog reading taken at identify time, not a revision number. **You
-  cannot tell from `0x00` whether a firmware flash happened** — the only
-  stable identifier (the build date) does not change on a same-build
-  reflash, so confirming an update still needs a whole-bus capture (note
-  at the top of §31).
+- **The firmware version is `byte[0].byte[1].byte[4]`, decimal.** Here
+  `00 . 01 . 0x27` → **`00.01.39`**, which is exactly what Xgpro prints in
+  its connect log (`Device 1: T48 [TL866-3G] Ver: 00.01.39`). `byte[4]`
+  is the build number; it reads **`0x27` (39) stably** across back-to-back
+  reads.
+- **The flash the operator ran did take effect.** The cold-plug capture
+  *before* updating had `byte[4] = 0x03` (= `00.01.03`); after the update
+  it is `0x27` (= `00.01.39`). So `0x00` identify *can* tell you the
+  firmware version — the flash traffic itself still went to the
+  re-enumerated bootloader that an `a466:0a53`-locked capture misses (the
+  note at the top of §31 stands), but the **before/after version delta
+  confirms the update succeeded.**
+- The build-date string (`2024-08-15 17:21`) did **not** change across the
+  update — it is a fixed build-stamp in this firmware line, not the
+  user-facing version; the version lives in `byte[4]`.
+- The trailing 16-bit word is **NOT a version** — it is a **live,
+  ADC-like sample**. Read back-to-back it returned `0x05E7 / 0x05ED /
+  0x05E9 / 0x05EC` (≈1511–1517) and `0x05D1` (1489) earlier: a few counts
+  of jitter, i.e. an analog reading taken at identify time. (This corrects
+  an earlier draft that mistook this word for the version.)
 - Immediately after, the capture shows `0x3D` (`SWITCH`, carrying an
   8-byte magic `23 01 67 45 AB 89 EF CD`) and `0x3F` (`RESET`) — both
   consistent with the §3 names.
