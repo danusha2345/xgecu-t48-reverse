@@ -1903,6 +1903,14 @@ The practical consequence is actually a **simplification** — our
 prototype's `connect → begin_transaction → init_emmc → …` flow is
 correct as-is, with **no `0x2B` step needed**.
 
+> **Update (live capture, §33.1):** the adapter *does* have a
+> USB-visible channel after all — but it is **top-opcode `0x24`**, not
+> `0x2B`. Over `0x24` the PC reads the adapter's identity string
+> (`"XGecu Directly"`); the crypto authentication still happens off the
+> wire between the adapter and the T48 firmware, so the "PC does not
+> participate in auth" point above stands. See §33 for the full eMMC-ISP
+> capture.
+
 ### 28.2 `FUN_004fc156` is `CreateFileA`, not "partition switch"
 
 §27.4 earlier read the call `FUN_004fc156(param_7, 0x8040, 0)` inside
@@ -2398,3 +2406,100 @@ Our prototype (`examples/t48_emmc.py` low-level `ep1_send`/`ep1_recv`/
 This is the first confirmation that the reverse-engineered classic
 transport supports a **complete read-modify-write-verify cycle from
 Linux**, matching first-party Xgpro on the wire.
+
+## 33. eMMC-ISP through the adapter — full read+verify captured (the core target)
+
+The capture this project was built for: a **4-bit / 3.3 V eMMC in-circuit
+read through the XGecu ISP adapter**, of the **boot partitions + RPMB +
+128 MB of the user area**, followed by a **verify pass**. 42 k packets,
+~150 MB streamed on EP2 IN. This confirms most of §7–§30 on real silicon
+and, for the first time, shows the **adapter channel** and the **eMMC
+init handshake** that were marked TBD.
+
+### 33.1 The adapter channel is top-opcode `0x24` (resolves §27/§28)
+
+The ISP adapter is driven over a **dedicated top-opcode `0x24`** (not
+`0x2B`, which §28.1 already retracted). Sub-ops seen: `0xe0`, `0xf0`,
+`0xf1`. Its reply carries the adapter's identity string:
+
+```
+host → 0x01 OUT:  24 f0 00 00 01 00 00 00
+host → 0x01 OUT:  24 e0 28 00 00 ... e5
+dev  → 0x81 IN :  24 00 10 00 00 08 00 00  "XGecu Directly" 00…  09 00 a0 ad
+```
+
+So the in-circuit adapter announces itself as **`XGecu Directly`**. A
+`0x3E` opcode (new) follows with a 16-byte status reply
+(`3e 00 10 00 …ff 57 00`) — the same `…57 00`-trailered status family as
+`READ_PINS`.
+
+### 33.2 eMMC init handshake (was TBD)
+
+In order, before any bulk transfer:
+
+| Step | EP1 OUT | Reply | Meaning |
+|------|---------|-------|---------|
+| BEGIN | `03 31 00 00 00 05 a1 00 …` | — | **`protocol_id = 0x31` (eMMC)** ✓, `data_memory_size@0x08 = 32`, `code_memory_size@0x10 = 512` |
+| status | `39 31 00 00 00 05 a1 00` | 32 B zero | OVC clear |
+| init | `21 00 00 00 00 00 00 00` | `21 00 00 00 80 80 ff c0` | algorithm/init → OCR-like `80 80 ff c0` |
+| READID | `05 00 00 00 …` | `07 …80 80 ff c0` **CID** `44 00 01 45 30 30 34 47 39 …` | **CID**, PNM ASCII `"E004G9"` |
+| READ_USER | `06 00 00 00 …` | 24 B (`…32 00 0f d0 ff 03 …`) | CSD / card status |
+| EXT_CSD | `08 48 00 02 00 00 00 00` | 512 B on EP2 IN + 8 B ack | `0x08`/`0x48` single-block (EXT_CSD) |
+| SWITCH ×4 | `27 46 …` | `27 00 10 00 00 08 00 00` | CMD6 (see §33.3) |
+| CMD30 | `08 5e 04 00 …` | — | §26.2 wrapper |
+
+`0x05`/`0x06` are reused from the classic set to surface the CID and CSD;
+`0x21` is the eMMC-specific init.
+
+### 33.3 CMD6 SWITCH = the partition selector (validates §7/§24 byte-for-byte)
+
+Each SWITCH is `27 46 00 00 00 [val] b3 [access]` — i.e. **set EXT_CSD[179]
+`PARTITION_CONFIG`** (`0xb3 = 179`) to `[val]`, whose low 3 bits pick the
+hardware partition:
+
+| Command bytes | val | partition |
+|---------------|-----|-----------|
+| `27 46 00 00 00 01 b3 01` | 1 | **BOOT1** |
+| `27 46 00 00 00 02 b3 01` | 2 | **BOOT2** |
+| `27 46 00 00 00 03 b3 01` | 3 | **RPMB** |
+| `27 46 00 00 00 07 b3 02` | clear | **USER** (CLEAR_BITS 0x07) |
+
+`27 46 00 00 00 03 b3 01` and `27 46 00 00 00 07 b3 02` are **exactly** the
+bytes the prototype's `cmd_A(SWITCH→RPMB)` / `cmd_A(SWITCH→USER restore)`
+emit — the §7/§24 SWITCH encoding is now hardware-confirmed.
+
+The session walks: `→RPMB → →USER → →BOOT1 [read] → →BOOT2 [read] → →RPMB
+→ →USER [read 128 MB]`, then a **verify pass** repeats `→BOOT1 → →BOOT2 →
+→RPMB → →USER`. That is the "system partitions + 128 MB user area, then
+verify" operation.
+
+### 33.4 Bulk read transfer — `0x0D` setup + `0x14`/`0x15` streaming → EP2 IN
+
+Each partition read is set up by a **40-byte `0x0D`** descriptor, e.g.:
+
+```
+0d 01 00 00 | 00 00 00 00 | 00 02 00 00 | 20 00 00 00 | 00 01 00 00 |
+20 00 00 00 | 20 00 00 00 | 01 00 00 00 | 01 00 00 00 | 00 00 00 00
+```
+(start LBA, block size `0x200`, and a length/count field that scales with
+the read — `0x0100` for the small boot reads vs `0x2000` for the 128 MB
+user read). The data then streams as **514 `0x14`(setup)/`0x15`(trigger)
+16-byte pairs**, with the payload arriving on **EP2 IN (`0x82`)** in
+**16 KB and 32 KB** USB transfers — ~150 MB across the read + verify.
+
+### 33.5 What this nails down
+
+- **Adapter channel = `0x24`**, identity `XGecu Directly` — the missing
+  piece of §27/§28.
+- The **full eMMC init handshake** (`0x21`/`0x05`/`0x06`/`0x08·0x48`),
+  previously TBD, is now a concrete sequence with real replies (CID, CSD,
+  OCR-like word).
+- **CMD6 SWITCH partition map** (BOOT1/BOOT2/RPMB/USER via
+  `PARTITION_CONFIG`) confirmed, and our SWITCH byte encoding matches the
+  wire exactly.
+- **Bulk eMMC reads use EP2 IN** at scale (~150 MB), via `0x0D` +
+  `0x14`/`0x15`.
+
+Still adapter-gated for *our* prototype (the `0x24` channel authenticates
+to the adapter), but the protocol is no longer guesswork — this is the
+reference capture for implementing eMMC-ISP read on the Linux side.
