@@ -583,9 +583,13 @@ class T48Emmc:
     # See §28.1 of docs/PROTOCOL.md for the full correction.
     def identify_programmer(self) -> bytes:
         """First thing Xgpro sends on a fresh handle (FUN_004dba90):
-        8 zero bytes EP1 OUT → 64 bytes EP1 IN.  reply[10] is the T48
-        model code (0x05 / 0x06 / 0x07 are recognised values).
-        Returns the full 64-byte info block."""
+        8 zero bytes EP1 OUT → 63-byte info record EP1 IN (live-confirmed,
+        PROTOCOL.md §31.1).  Layout: 8-byte header (reply[6] = programmer
+        model: 0x05 TL866II+ / 0x06 T56 / 0x07 T48 / 0x08 T76), then a
+        NUL-terminated build-date string, the per-unit serial, and a
+        trailing 16-bit word that is a *dynamic ADC-like sample, not a
+        firmware version*.  recv(0x40) reads the up-to-64 bytes the device
+        actually returns (63)."""
         self.ep1_send(b'\x00' * 8)
         return self.ep1_recv(0x40)
 
@@ -595,11 +599,13 @@ class T48Emmc:
         self.ep1_send(struct.pack('<BB6x', 0x2D, 0))
 
     def read_pins(self) -> bytes:
-        """READ_PINS (top-op 0x35).  Returns 40-byte status block.
-        reply[8..48] = per-pin state (1 byte per pin, indices map to
-        physical ZIF pin numbers — same convention as minipro's
-        tl866iiplus_pin_test). Safe to call without a chip in the
-        socket once a test bitstream has been loaded."""
+        """READ_PINS (top-op 0x35).  Returns a 16-byte status block
+        (live-confirmed, PROTOCOL.md §31.2 — NOT 40 bytes as the static
+        guess assumed): 8-byte header `35 00 10 00 27 01 07 00` then a
+        6-byte (48-pin) bitmask at reply[8..14] (one bit per pin; driving
+        pin N reads back with bit N cleared), then a 2-byte trailer.
+        Idle with no driver bitstream loaded the mask is all-zero. Safe
+        to call without a chip in the socket."""
         self.ep1_send(struct.pack('<BB6x', 0x35, 0))
         return self.ep1_recv(0x28)
 

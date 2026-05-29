@@ -10,13 +10,14 @@ USB transfer to a file so the session becomes ground truth for docs/PROTOCOL.md.
 Each step is independent and non-fatal: one failing call does not stop the rest,
 so even a partial run tells you which opcodes the firmware answers.
 
-Steps:
+Steps (reply formats confirmed live — see docs/PROTOCOL.md §31):
   1. connect             — open a466:0a53
-  2. identify_programmer — 8 zero bytes -> 64-byte info block; byte[10] = model
+  2. identify_programmer — 8 zero bytes -> 63-byte info; byte[6] = model,
+                           then NUL-terminated build date + serial
   3. measure_voltages    — read back idle rail voltages (no chip required)
   4. request_status      — 32-byte status block + OVC bit (may need a session;
                            treated as best-effort)
-  5. read_pins           — 40-byte pin-state block
+  5. read_pins           — 16-byte block; reply[8..14] = 6-byte (48-pin) bitmask
 
 It deliberately NEVER calls begin_transaction() / init_emmc() / bulk_* — those
 drive voltage and start an eMMC session, which needs the crypto adapter + a chip.
@@ -70,14 +71,21 @@ def main() -> int:
               "(run as root or add a udev rule for a466:0a53).")
         return 1
 
-    info = step("identify_programmer()  (8 zero bytes -> 64-byte info)",
+    info = step("identify_programmer()  (8 zero bytes -> 63-byte info)",
                 dev.identify_programmer)
     if info:
         print(_hexblock(info))
-        if len(info) > 10:
-            model = info[10]
+        if len(info) > 6:
+            model = info[6]
             name = {0x05: "TL866II+", 0x06: "T56", 0x07: "T48", 0x08: "T76"}.get(model, "?")
-            print(f"    model byte[10] = 0x{model:02x} ({name})")
+            print(f"    model byte[6] = 0x{model:02x} ({name})")
+        # NUL-terminated build date right after the 8-byte header
+        build = info[8:].split(b"\x00", 1)[0].decode("latin1", "replace")
+        print(f"    firmware build = {build!r}")
+        # trailing 16-bit word is a live ADC-like sample, NOT a fw version (§31.1)
+        if len(info) >= 7:
+            word = info[-7] | (info[-6] << 8)
+            print(f"    trailing word  = 0x{word:04x} (dynamic sample, not a fw version)")
 
     volts = step("measure_voltages()  (idle rails)", dev.measure_voltages)
     if volts:
@@ -91,7 +99,7 @@ def main() -> int:
         if len(status) > 12:
             print(f"    OVC bit (byte[12] & 1) = {status[12] & 1}")
 
-    pins = step("read_pins()  (40-byte pin-state block)", dev.read_pins)
+    pins = step("read_pins()  (16-byte block; reply[8..14] = 48-pin bitmask)", dev.read_pins)
     if pins:
         print(_hexblock(pins))
 

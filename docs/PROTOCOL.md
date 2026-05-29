@@ -2218,18 +2218,30 @@ IN:
 
 ```
 host → EP1 OUT (8):  00 00 00 00 00 00 00 00
-dev  → EP1 IN (63):  00 01 30 00 03 01 07 00            ; 8-byte header
+dev  → EP1 IN (63):  00 01 30 00 27 01 07 00            ; 8-byte header
                      "YYYY-MM-DDHH:MM" 00                ; firmware build timestamp, NUL-terminated
                      "<32-char device serial>" 00        ; per-unit serial (redacted here)
-                     D1 05 00 00 01 00 00                ; u16 LE version 0x05D1 + flags
+                     E7 05 00 00 01 00 00                ; trailing word + flags — see below
 ```
 
 - Header byte **`[6] = 0x07`** = **programmer model** — matches §29.1
   (`DAT_0080109b`: 7 = T48). The same `… 01 07 00` triplet appears in the
   `READ_PINS`/`MEASURE_VOLTAGES` replies below, i.e. **byte[6] of every
   EP1 reply carries the model code**.
-- The build timestamp + version word are exactly what Xgpro reads to
-  decide whether a firmware update is needed.
+- Header byte `[4]` is **not constant**: `0x03` in the cold-plug firmware
+  capture, `0x27` on every read after the device has done some activity —
+  looks state/mode-dependent, exact meaning TBD.
+- The **firmware build identifier is the timestamp string** (`2024-08-15
+  17:21` here), and it was **unchanged** across all captures.
+- The trailing 16-bit word is **NOT a firmware version** — it is a
+  **live, ADC-like sample**. Read back-to-back three times it returned
+  `0x05E7 / 0x05ED / 0x05E9` (1511 / 1517 / 1513), and `0x05D1` (1489) in
+  the earlier capture: a few counts of jitter around ~1510, i.e. an
+  analog reading taken at identify time, not a revision number. **You
+  cannot tell from `0x00` whether a firmware flash happened** — the only
+  stable identifier (the build date) does not change on a same-build
+  reflash, so confirming an update still needs a whole-bus capture (note
+  at the top of §31).
 - Immediately after, the capture shows `0x3D` (`SWITCH`, carrying an
   8-byte magic `23 01 67 45 AB 89 EF CD`) and `0x3F` (`RESET`) — both
   consistent with the §3 names.
@@ -2281,5 +2293,27 @@ idle self-check.
   per-pin result is a **6-byte bitmask at offset 8**, not `reply[8..48]`;
   observed phase order is SET_OUT-walk → GND-walk → voltages/status.
 - **New:** top-opcode **`0x00` = device identify** (build date + serial +
-  version); the stable EP1-reply header shape `… 01 07 00` with the model
-  code at byte[6].
+  a trailing dynamic word, §31.1); the stable EP1-reply header shape
+  `… 01 07 00` with the model code at byte[6].
+
+### 31.4 Live `first_contact.py` run — idle read-backs (no chip, no bitstream)
+
+Running the prototype's safe probe against the device (connect → identify
+→ measure_voltages → request_status → read_pins, none of which apply
+programming voltage) reproduced the wire formats above and added:
+
+- **`MEASURE_VOLTAGES` (`0x33`) scaling is correct.** The minipro-derived
+  scale factors yield sane idle rails: **`vusb ≈ 4.976 V`** (the USB 5 V
+  bus — a clean sanity check), `vpp ≈ 11.14 V`, `vcc ≈ 3.37 V`,
+  `vccio ≈ 3.26 V`. So `0x33` returns real ADC data **even with no test
+  bitstream loaded**.
+- **`READ_PINS` (`0x35`) idle reply** = the 16-byte block
+  `35 00 10 00 27 01 07 00` + **all-zero** 6-byte mask — i.e. with no
+  driver bitstream loaded, no pin is asserted (as expected). Confirms the
+  16-byte size and the offset-8 mask from §31.2.
+- **`REQUEST_STATUS` (`0x39`)** with no active session = **32 zero bytes**,
+  OVC bit clear — a safe idle baseline.
+
+All four endpoints, the identify record, and these read-backs are
+reproducible from Linux via libusb with no udev rule on this host (the
+device node already carries a uaccess ACL).
