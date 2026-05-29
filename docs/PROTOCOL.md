@@ -2503,3 +2503,30 @@ user read). The data then streams as **514 `0x14`(setup)/`0x15`(trigger)
 Still adapter-gated for *our* prototype (the `0x24` channel authenticates
 to the adapter), but the protocol is no longer guesswork — this is the
 reference capture for implementing eMMC-ISP read on the Linux side.
+
+### 33.6 Bus width (1-bit vs 4-bit) is a host-side `BEGIN` byte — not a CMD6 switch
+
+Comparing the 4-bit/3.3 V capture above with a **1-bit, 64 MB** read of
+the *same* eMMC (same CID `…E004G9`, same adapter, same partition walk),
+the two `BEGIN_TRANSACTION` packets differ in **exactly two bytes**:
+
+| offset | 1-bit | 4-bit | meaning |
+|-------:|:-----:|:-----:|---------|
+| `0x0c` | `0x51` | `0x54` | algorithm / bus-width selector |
+| `0x3f` | `0x51` | `0x54` | same value, duplicated (`DAT_007a39a9`, §30) |
+
+`0x51` / `0x54` are the `.alg` algorithm numbers **`EMMC_51` (1-bit)** and
+**`EMMC_54` (4-bit)** — i.e. the FPGA bitstream that bit-bangs the eMMC
+bus. Crucially, **neither capture contains a CMD6 `BUS_WIDTH` switch**
+(`EXT_CSD[183]`, index `0xb7`): the SWITCH set is identical
+(`PARTITION_CONFIG` only). So the data-bus width is chosen **entirely
+host-side** by picking the bitstream in `BEGIN[0x0c]/[0x3f]` — the eMMC
+itself is never told to change `BUS_WIDTH`.
+
+Consequence for the §30 map: `BEGIN[0x0c]` (the low byte of the
+"page_size" field) and `BEGIN[0x3f]` (`DAT_007a39a9`) together carry the
+**algo/bus-width code**, and it overrides the per-chip-DB variant letter —
+in these ISP reads the DB `variant` bytes `[0x02..03]` are `00 00`, and
+the live selector is `0x51`/`0x54`. The 1-bit read is also ~1.6× slower
+on the wire (61 s vs 37 s; ~100 MB vs ~150 MB on EP2 IN), as expected for
+the narrower bus.
