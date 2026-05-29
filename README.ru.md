@@ -35,6 +35,11 @@
   команд, init-последовательность, layout JEDEC RPMB-frame, формат
   файла `.alg` и форматы bulk-передач. Русская версия:
   [`PROTOCOL.ru.md`](docs/PROTOCOL.ru.md).
+- [`docs/ISP_SETTINGS.md`](docs/ISP_SETTINGS.md) — справочник
+  простым языком по **настройкам eMMC ISP** в Xgpro (ширина шины, VCCQ,
+  `ICSP_VCC Enable`, CLK, `Vcc current Imax`, разделы, подтяжка RST_n): что
+  делает каждая и что включать/выключать, сверено с захватами протокола.
+  Русская версия: [`ISP_SETTINGS.ru.md`](docs/ISP_SETTINGS.ru.md).
 - [`examples/t48_emmc.py`](examples/t48_emmc.py) — небольшой
   pyusb-прототип: подключается к T48 по VID:PID, собирает
   документированные пакеты и вызывает их через высокоуровневые методы

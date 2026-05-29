@@ -31,6 +31,11 @@ small Python prototype that uses the same encoding.
   (EP1 OUT/IN command + EP2 OUT bulk), the top-opcode / sub-opcode
   hierarchy, eMMC command table, init flow, RPMB frame layout, the
   `.alg` algorithm-file format, and the bulk transfer formats.
+- [`docs/ISP_SETTINGS.md`](docs/ISP_SETTINGS.md) — a plain-language
+  reference for the Xgpro **eMMC ISP settings** (bus width, VCCQ,
+  `ICSP_VCC Enable`, CLK, `Vcc current Imax`, partitions, RST_n wiring):
+  what each does and what to enable / disable, cross-checked against the
+  wire captures. Russian: [`ISP_SETTINGS.ru.md`](docs/ISP_SETTINGS.ru.md).
 - [`examples/t48_emmc.py`](examples/t48_emmc.py) — a small pyusb
   prototype: connect to the T48 by VID:PID, build the documented
   packets, and call them through high-level methods
