@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-t48_emmc_isp.py — arbitrary eMMC read/write over the XGecu ISP adapter, 1-bit / 3.3 V.
+t48_emmc_isp.py — arbitrary eMMC read/write over the XGecu ISP adapter (1-bit).
 
 This REPLAYS the exact eMMC-ISP flow captured from Xgpro (docs/PROTOCOL.md
 §33–§34), parameterised by block address, so we can read/write an arbitrary
@@ -10,17 +10,22 @@ region from Linux. Requires the XGecu eMMC-ISP adapter + a connected eMMC
 Two modes:
   (default)  read-only validation — adapter handshake + init, print CID, then
              read one arbitrary 16 KB chunk and hexdump it. Non-destructive.
-  --write-test BLOCK   backup -> write pattern -> verify -> restore on one
-             16 KB chunk at BLOCK. Writes to the eMMC; the original is saved
-             to disk and written back, then re-verified.
+  --write-test BLOCK   write a marker pattern to one 16 KB chunk at BLOCK,
+             read it back and verify. DESTRUCTIVE (overwrites that chunk).
+
+VCCQ: --voltage 3.3 (default, capture-confirmed) or 1.8. The 1.8 V byte
+(BEGIN[0x15]=1) is derived from static reverse of Xgpro.exe and is NOT yet
+verified on hardware — only use it on a chip you know is 1.8 V.
 
 Block addressing: 1 block = 512 B; one transfer chunk = 32 blocks = 16 KB.
-1-bit / 3.3 V is fixed by the captured BEGIN templates (bus-width byte 0x51).
+Bus width is 1-bit (BEGIN bus-width byte 0x51); read+write are hardware-
+verified at 3.3 V.
 
 USAGE:
   python3 t48_emmc_isp.py                         # read-only validation @ block 0x8000
   python3 t48_emmc_isp.py --block 0x100000        # read-only @ another block
-  python3 t48_emmc_isp.py --write-test 0x8000     # full r/w round-trip (DESTRUCTIVE)
+  python3 t48_emmc_isp.py --write-test 0x8000     # write+read-back verify (DESTRUCTIVE)
+  python3 t48_emmc_isp.py --voltage 1.8           # 1.8 V VCCQ (UNVERIFIED)
 """
 import argparse, struct, sys, time
 import usb.core, usb.util
@@ -61,8 +66,19 @@ def _set_u32(buf, off, val):
 
 
 class EmmcIsp:
-    def __init__(self, log=None):
+    def __init__(self, log=None, vccq_18=False):
         self.d = T48Emmc(log_path=log)
+        self.vccq_18 = vccq_18      # False = 3.3 V (captured), True = 1.8 V
+
+    def _begin(self, base):
+        # BEGIN_TRANSACTION byte[0x15] = VCCQ selector (DAT_007485c8 in
+        # FUN_00444bc0 @ 0x444edd): 0x00 = 3.3 V, 0x01 = 1.8 V. The 3.3 V
+        # value is capture-confirmed; 1.8 V is derived from static reverse
+        # (the cmp sites at 0x4953a0/0x493d61 treat it as 0=3.3V/50MHz vs
+        # nonzero=1.8V/HS200) and is NOT hardware-verified.
+        b = bytearray(base)
+        b[0x15] = 0x01 if self.vccq_18 else 0x00
+        return bytes(b)
 
     def connect(self):
         self.d.connect()
@@ -114,7 +130,7 @@ class EmmcIsp:
 
     # ---- arbitrary read (USER partition) ----
     def read(self, start_block, n_chunks):
-        info = self._adapter_and_init(BEGIN_READ)
+        info = self._adapter_and_init(self._begin(BEGIN_READ))
         self._arm_bulk()
         setup = _set_u32(_set_u32(RD_SETUP, 4, start_block), 16, n_chunks)
         self.d.ep1_send(setup)
@@ -132,7 +148,7 @@ class EmmcIsp:
     def write(self, start_block, data, erase=False):
         assert len(data) % CHUNK == 0, "data must be a multiple of 16 KB"
         n_chunks = len(data) // CHUNK
-        info = self._adapter_and_init(BEGIN_WRITE)
+        info = self._adapter_and_init(self._begin(BEGIN_WRITE))
         # write goes straight to USER (no 0x14/0x15 arm — that is read-only)
         self.d.ep1_send(SWITCH_USER); self.d.ep1_recv(64)
         if erase:
@@ -173,10 +189,16 @@ def main():
     ap.add_argument("--write-test", type=lambda x: int(x, 0), metavar="BLOCK",
                     help="DESTRUCTIVE: backup->write->verify->restore one 16KB chunk at BLOCK")
     ap.add_argument("--erase", action="store_true", help="erase the region before write")
+    ap.add_argument("--voltage", choices=("3.3", "1.8"), default="3.3",
+                    help="VCCQ I/O voltage: 3.3 (capture-confirmed) or 1.8 "
+                         "(static-reverse, UNVERIFIED on hardware)")
     ap.add_argument("--log", default="t48_emmc_isp.log")
     args = ap.parse_args()
 
-    e = EmmcIsp(log=args.log)
+    e = EmmcIsp(log=args.log, vccq_18=(args.voltage == "1.8"))
+    print(f"   VCCQ = {args.voltage} V"
+          + ("  [1.8 V is static-reverse-derived, not hardware-verified]"
+             if args.voltage == "1.8" else ""))
     e.connect()
     try:
         if args.write_test is None:
