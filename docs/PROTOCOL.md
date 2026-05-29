@@ -112,6 +112,7 @@ EP1 command packet = [byte 0: top-opcode] [byte 1..7: sub-opcode/args]
 
 | Top-opcode | Origin           | Purpose                                          | byte[1..7]                                       |
 |------------|------------------|--------------------------------------------------|--------------------------------------------------|
+| `0x00`     | Xgpro (live §31) | **device identify** — build date + serial + version | all-zero 8-byte req → 63-byte reply           |
 | `0x02`     | minipro (classic)| `NAND_INIT`                                      | —                                                |
 | `0x03`     | minipro (classic)| **`BEGIN_TRANSACTION`** (protocol_id, voltages, clock, sizes) | 64-byte packet                  |
 | `0x04`     | minipro          | `END_TRANSACTION`                                | —                                                |
@@ -1254,6 +1255,10 @@ into it is a common way to latch up the chip.
 
 ### 22.7 Pre-flight self-check sequence (Ghidra-decoded)
 
+> **Validated against hardware in §31.** The op-code sequence below is
+> correct, but the live capture shows `READ_PINS` replies are **16 bytes
+> (6-byte pin bitmask at offset 8), not 40** — see §31.2.
+
 Xgpro's "System Self-check" function (`FUN_004532e0`) is the **safest
 possible activation pattern** the firmware uses to validate itself.
 We can reproduce it offline in our own software to prove the
@@ -2181,3 +2186,100 @@ The prototype's `build_begin_transaction()` was updated to match this
 map: it now fills only `0x00/0x01/0x02/0x08/0x0a/0x10` (the stable
 per-chip-DB fields) and leaves `0x03..08` and `0x14..3f` zero for the
 capture to fill.
+
+## 31. First hardware session — live USBPcap validation
+
+This is the **first section confirmed against real device traffic** (no
+longer static-only). Two USBPcap captures were taken on the day the T48
+arrived (2026-05-29) under first-party Xgpro on Windows:
+
+- a short **connect / version** capture (20 packets), and
+- a full **System Self-check** capture (1422 packets, 9.1 s).
+
+Device reported itself as: firmware build **`2024-08-15 17:21`**, version
+word **`0x05D1` (1489)**, model T48. Enumeration was **high-speed USB
+2.0 (480 Mbit/s)** with exactly **four bulk endpoints** —
+`0x01`/`0x81` and `0x02`/`0x82`, all `wMaxPacketSize = 512` — which
+**directly confirms the §2 endpoint map** (EP1 short commands, EP2 bulk).
+
+> Note on the firmware capture: it contains **no firmware payload**. A
+> real flash makes the TL866/T48 re-enter a **bootloader that
+> re-enumerates** (possibly under a different identity), so a USBPcap
+> filter locked to `a466:0a53` will not see the flash blocks. To capture
+> an actual update, capture the **whole root hub**, not the device. In
+> this session the device only reported its (already-current) version,
+> so nothing was missed.
+
+### 31.1 Identify / version handshake — top-opcode `0x00` (new)
+
+Not previously in the §3 table. At connect Xgpro sends an **all-zero
+8-byte packet** on EP1 OUT and reads back a 63-byte info record on EP1
+IN:
+
+```
+host → EP1 OUT (8):  00 00 00 00 00 00 00 00
+dev  → EP1 IN (63):  00 01 30 00 03 01 07 00            ; 8-byte header
+                     "YYYY-MM-DDHH:MM" 00                ; firmware build timestamp, NUL-terminated
+                     "<32-char device serial>" 00        ; per-unit serial (redacted here)
+                     D1 05 00 00 01 00 00                ; u16 LE version 0x05D1 + flags
+```
+
+- Header byte **`[6] = 0x07`** = **programmer model** — matches §29.1
+  (`DAT_0080109b`: 7 = T48). The same `… 01 07 00` triplet appears in the
+  `READ_PINS`/`MEASURE_VOLTAGES` replies below, i.e. **byte[6] of every
+  EP1 reply carries the model code**.
+- The build timestamp + version word are exactly what Xgpro reads to
+  decide whether a firmware update is needed.
+- Immediately after, the capture shows `0x3D` (`SWITCH`, carrying an
+  8-byte magic `23 01 67 45 AB 89 EF CD`) and `0x3F` (`RESET`) — both
+  consistent with the §3 names.
+
+### 31.2 System Self-check — live decode (validates & corrects §22.7)
+
+The self-check uses **only EP1** (no EP2 / eMMC), confirming it is safe
+with an empty socket. Command framing seen on the wire is the documented
+8-byte `[op][00 00 00][u32 arg LE]`; pin-pattern setters use a 24-byte
+form. Three phases were observed, in this order:
+
+1. **`SET_OUT` walk** — for index `N = 0,1,2,…`: `0x36` (select, arg=N) →
+   `0x35` `READ_PINS` → `0x31` `SET_PULLUPS` (release).
+2. **`SET_GND` walk** — `0x30` (24-byte one-hot pin pattern) → `0x35`
+   `READ_PINS`.
+3. **Voltage / status** — `0x33` `MEASURE_VOLTAGES` → 24-byte reply;
+   `0x39` `REQUEST_STATUS` → 32-byte reply; bracketed by `0x2D`
+   `RESET_PIN_DRIVERS` at the very start and end.
+
+**`READ_PINS` (`0x35`) reply is 16 bytes — not 40** (this corrects the
+"recv 40B" guess in §22.7 step 4c):
+
+```
+35 00 10 00 27 01 07 00   <6-byte pin bitmask>   57 00
+└─ echo + header (8) ───┘  └─ pins[8..14) ────┘   └ trailer
+```
+
+The 48-bit mask is proof of a **walking-bit continuity test**: driving
+index `N` reads back with **exactly bit `N` cleared**, all others set —
+`N=0 → FE`, `1 → FD`, `2 → FB`, `3 → F7`, … `7 → 7F`, `8 → FF FE`,
+`9 → FF FD`, … So `READ_PINS` returns a 6-byte (48-pin) bitmask at
+offset 8, **not** the `reply[8..48]` per-byte array §22.7 assumed.
+
+**`MEASURE_VOLTAGES` (`0x33`) reply is 24 bytes:** same 8-byte header
+(`33 00 10 00 27 01 07 00`) followed by **four `u32` LE rail readings**.
+One healthy idle sample: `1251, 1492, 1241, 2020` (raw units — mV vs ADC
+counts is still TBD, one calibrated capture away).
+
+**`REQUEST_STATUS` (`0x39`) reply = 32 bytes**, all-zero on a healthy
+idle self-check.
+
+### 31.3 What this session confirmed / corrected / added
+
+- **Confirmed:** the §2 endpoint map (4 bulk EPs, 512 B); the minipro
+  opcode names `0x2D/0x2E/0x2F/0x30/0x31/0x32/0x33/0x35/0x36/0x39` seen
+  carrying exactly the expected bytes; §29.1's model byte (`7` = T48),
+  now visible as byte[6] of every EP1 reply.
+- **Corrected vs §22.7:** `READ_PINS` replies are **16 B, not 40 B**; the
+  per-pin result is a **6-byte bitmask at offset 8**, not `reply[8..48]`;
+  observed phase order is SET_OUT-walk → GND-walk → voltages/status.
+- **New:** top-opcode **`0x00` = device identify** (build date + serial +
+  version); the stable EP1-reply header shape `… 01 07 00` with the model
+  code at byte[6].
