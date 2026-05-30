@@ -100,6 +100,19 @@ the slow probe clock and accepting the fastest index whose read of the same bloc
 matches byte-for-byte (so a CRC-corrupt over-clock is rejected, not silently
 used).
 
+> **Cross-checked against this repo's Xgpro captures — mostly confirmed, one
+> nuance.** ✅ The clock lives in `0x21`/`0x05`/`0x06` byte[1]: Xgpro's 1-bit read
+> bumps to `0x04`, its 4-bit read to `0x05`, each after a `0x00` probe pass — and
+> `BEGIN` is byte-identical across them bar the bus-width bytes `0x0c`/`0x3f`, so
+> the clock is **not** in `BEGIN`. (This also corrects an earlier guess that
+> byte[1] was a "session counter" — it is the clock.) ⚠️ **Nuance on `OP_3E[5]`:**
+> every captured Xgpro read keeps `OP_3E[5] = 0x08`, *including* the 4-bit /
+> index-`0x05` ("40 MHz") one — Xgpro never sends `0x09`. So to mirror Xgpro's
+> 40 MHz it is enough to set init byte[1] = `0x05` and leave `OP_3E[5] = 0x08`;
+> the `0x09` in the tables above comes from this project's own port experiments,
+> not from Xgpro. Worth re-testing whether `0x09` actually changes the clock or is
+> a no-op next to the byte[1] index.
+
 ## 6. `Vcc current Imax`
 
 - Over-current limit (short protection). **`Default`** for normal use;
