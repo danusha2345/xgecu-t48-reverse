@@ -69,6 +69,28 @@ def _set_u32(buf, off, val):
     b = bytearray(buf); struct.pack_into("<I", b, off, val & 0xFFFFFFFF); return bytes(b)
 
 
+# JEDEC eMMC manufacturer IDs (CID byte[0] AFTER word-swap, see _decode_cid).
+_MID = {0x02: "SanDisk", 0x11: "Toshiba/Kioxia", 0x13: "Micron", 0x15: "Samsung",
+        0x45: "SanDisk", 0x70: "Kingston", 0x90: "SK Hynix", 0x9B: "YMTC",
+        0xD6: "Foresee", 0xFE: "Micron"}
+
+
+def _decode_cid(reg16):
+    """The T48 returns CID/CSD as FOUR 32-bit little-endian words, NOT a flat
+    JEDEC MSB-first register. Reading the 16-byte register as-is gives a bogus
+    MID and a garbled PNM (and e.g. a 2019 date for a 2024 part). Swapping each
+    4-byte word back yields the real register — proven by CRC7 matching only for
+    the swapped order. Returns (swapped, manufacturer, pnm, rev, sn, date)."""
+    c = b''.join(reg16[i:i + 4][::-1] for i in range(0, 16, 4))
+    mid = c[0]
+    pnm = ''.join(chr(x) if 32 <= x < 127 else '.' for x in c[3:9])
+    rev = f"{c[9] >> 4}.{c[9] & 0xF}"
+    sn = int.from_bytes(c[10:14], "big")
+    mdt = c[14]
+    date = f"{2013 + (mdt >> 4)}-{(mdt & 0xF):02d}"
+    return c, _MID.get(mid, f"Unknown(0x{mid:02x})"), pnm, rev, sn, date
+
+
 class EmmcIsp:
     def __init__(self, log=None, vccq_18=False):
         self.d = T48Emmc(log_path=log)
@@ -377,10 +399,11 @@ def main():
             # --- non-destructive validation ---
             print(f"== read-only validation @ block 0x{args.block:x} (16 KB) ==")
             info, data = e.read(args.block, 1)
-            cid = info["cid"][8:24] if len(info["cid"]) >= 24 else info["cid"]
-            pnm = ''.join(chr(c) if 32 <= c < 127 else '.' for c in cid)
+            reg = info["cid"][8:24] if len(info["cid"]) >= 24 else info["cid"]
+            _, man, pnm, rev, sn, date = _decode_cid(reg)
             print(f"  adapter ident : {info['ident'][8:].split(bytes([0]))[0].decode('latin1','replace')!r}")
-            print(f"  CID           : {cid.hex()}  ('{pnm}')")
+            print(f"  CID (raw 16B) : {reg.hex()}  (32-bit LE words — see _decode_cid)")
+            print(f"  CID (decoded) : {man} '{pnm}' Rev={rev} SN=0x{sn:08x} Date={date}")
             print(f"  OCR-like      : {info['ocr'].hex()}")
             print(f"  data @0x{args.block:x}:")
             print(_hexdump(data))

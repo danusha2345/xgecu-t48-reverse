@@ -2449,7 +2449,7 @@ In order, before any bulk transfer:
 | BEGIN | `03 31 00 00 00 05 a1 00 …` | — | **`protocol_id = 0x31` (eMMC)** ✓, `data_memory_size@0x08 = 32`, `code_memory_size@0x10 = 512` |
 | status | `39 31 00 00 00 05 a1 00` | 32 B zero | OVC clear |
 | init | `21 00 00 00 00 00 00 00` | `21 00 00 00 80 80 ff c0` | algorithm/init → OCR-like `80 80 ff c0` |
-| READID | `05 00 00 00 …` | `07 …80 80 ff c0` **CID** `44 00 01 45 30 30 34 47 39 …` | **CID**, PNM ASCII `"E004G9"` |
+| READID | `05 00 00 00 …` | `07 …80 80 ff c0` **CID** `44 00 01 45 30 30 34 47 39 …` | **CID** — but as 32-bit LE words: real decode = SanDisk `DG40…` (see §33.7), not `"E004G9"` |
 | READ_USER | `06 00 00 00 …` | 24 B (`…32 00 0f d0 ff 03 …`) | CSD / card status |
 | EXT_CSD | `08 48 00 02 00 00 00 00` | 512 B on EP2 IN + 8 B ack | `0x08`/`0x48` single-block (EXT_CSD) |
 | SWITCH ×4 | `27 46 …` | `27 00 10 00 00 08 00 00` | CMD6 (see §33.3) |
@@ -2537,6 +2537,30 @@ in these ISP reads the DB `variant` bytes `[0x02..03]` are `00 00`, and
 the live selector is `0x51`/`0x54`. The 1-bit read is also ~1.6× slower
 on the wire (61 s vs 37 s; ~100 MB vs ~150 MB on EP2 IN), as expected for
 the narrower bus.
+
+### 33.7 CID/CSD come as four 32-bit little-endian words (not a flat register)
+
+The 16-byte CID/CSD that follow the 8-byte reply header (`READID 0x05`,
+`READCSD 0x06`) are **not** a flat JEDEC MSB-first register. The T48 returns
+them as **four 32-bit little-endian words** — i.e. each consecutive 4-byte
+group is byte-reversed relative to the JEDEC layout. Decoding the raw 16 bytes
+as-is yields a **bogus MID and a garbled PNM** (and a wrong manufacturing date).
+
+Proof — CRC7 (`x^7+x^3+1`) over the first 15 bytes matches the stored CRC byte
+**only** after swapping each 4-byte word, and it matches for *both* registers
+independently (so it is not a coincidence):
+
+| capture | raw 16 B (as received) | forward decode | **word-swapped decode** | CRC7 |
+|---|---|---|---|---|
+| DJI Air 3S | `5900019b 363053305e 7c0034fc bb6945` | MID `0x59` (Unknown), PNM `·60S0^`, **2019-09** | **MID `0x9B` YMTC, PNM `Y0S064`, 2024-11**, SN `0x7C5E4569` | swap ✓ / forward ✗ |
+| §33.2 `…E004G9` | `44000145 30303447 39…` | MID `0x44` (Unknown), PNM `E004G9` | **MID `0x45` SanDisk, PNM `DG40…`** | — |
+
+So the §33.2 example was itself read in the wrong order: that chip is a
+**SanDisk** (`MID 0x45`, `DG40…`), not an unrecognised `0x44`/`"E004G9"`. The
+fix is a 4-byte-word swap before parsing — see `_decode_cid()` in
+`examples/t48_emmc_isp.py`. The **EXT_CSD** (512-byte data block on EP2 IN) is a
+byte stream, *not* a register, and must **not** be swapped (`SEC_COUNT@212`
+reads correctly as-is).
 
 ## 34. eMMC-ISP write — erase → program → verify (captured)
 
