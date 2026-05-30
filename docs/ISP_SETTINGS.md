@@ -68,6 +68,38 @@ powered → *disable* and don't wire VCC.
   Xgpro's first troubleshooting step. Long or untidy ISP leads ⇒ lower
   clock.
 
+### 5.1 Wire encoding of CLK (reversed from read dumps, hardware-verified)
+
+**The clock is NOT in the `BEGIN_TRANSACTION` packet.** `BEGIN` is byte-identical
+across all speeds (verified by diffing a slow ~8 MHz read vs a 40 MHz read — same
+64 bytes). The bus clock is selected by a **clock index** carried in the init
+commands and the `0x3E` op:
+
+| command (EP1 OUT)        | byte | slow probe | 40 MHz |
+|--------------------------|------|------------|--------|
+| `INIT` (`0x21 …`)        | `[1]`| `0x00`     | `0x05` |
+| `READ_ID` (`0x05 …`)     | `[1]`| `0x00`     | `0x05` |
+| `READ_CSD` (`0x06 …`)    | `[1]`| `0x00`     | `0x05` |
+| `OP_3E` (`0x3e 01 10 …`) | `[5]`| `0x08`     | `0x09` |
+
+Observed clock-index → throughput (1-bit, 3.3 V, real DJI eMMC over the T48 ISP):
+
+| index `[1]` / `OP_3E[5]` | ~clock          | 1-bit read |
+|--------------------------|-----------------|------------|
+| `0x00` / `0x08`          | probe (~8 MHz)  | **0.94 MB/s** |
+| `0x04` / `0x08`          | ~25 MHz         | ~2.5 MB/s  |
+| `0x05` / `0x09`          | **40 MHz**      | **4.5 MB/s** (≈ Xgpro 4.8) |
+| `0x06` / `0x09`          | 50 MHz?         | **hangs** — `ep1_recv` error, needs physical replug |
+
+So Xgpro's "MAX Speed Select = 40 MHZ" sends index `0x05`. `0x00` is only the
+initial probe clock; reading at it (as a naive port does by replaying the first
+captured init) is ~5× slower. **40 MHz (`0x05`/`0x09`) is the safe ISP ceiling;
+`0x06` (50 MHz) over the ISP leads wedged the programmer here.** Implementation
+note: an "AUTO" probe can pick the max safe clock by reading a reference block at
+the slow probe clock and accepting the fastest index whose read of the same block
+matches byte-for-byte (so a CRC-corrupt over-clock is rejected, not silently
+used).
+
 ## 6. `Vcc current Imax`
 
 - Over-current limit (short protection). **`Default`** for normal use;

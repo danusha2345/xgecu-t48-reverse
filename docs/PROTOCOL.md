@@ -2092,6 +2092,13 @@ pair for any normal eMMC read regardless of how the chip is wired.
 
 ## 30. Fourth corrections pass — verified `BEGIN_TRANSACTION` byte map
 
+> **Note (clock):** despite the `0x03` descriptor saying "…clock…", the bus
+> **CLK is NOT encoded in this 64-byte `BEGIN` packet** — `BEGIN` is byte-
+> identical at 8 MHz and 40 MHz. The clock index lives in the init commands
+> (`INIT/READ_ID/READ_CSD` byte[1]) and `OP_3E` byte[5]. See **ISP_SETTINGS §5.1**
+> for the hardware-verified encoding (`0x05`/`0x09` = 40 MHz ≈ 4.5 MB/s 1-bit;
+> `0x00`/`0x08` = slow probe ≈ 0.94 MB/s).
+
 Before hardware arrival the `BEGIN_TRANSACTION` builder was generated
 from the inferred §20.2 table. A fresh **radare2 trace of the actual
 store instructions in `FUN_00444bc0`** (not the decompiler's inferred
