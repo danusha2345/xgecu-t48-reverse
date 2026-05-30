@@ -2667,3 +2667,33 @@ in BEGIN changes between voltages.
   the captured bytes (confirms §28.1 / §33.1).
 - Verified ops at 3.3 V / 1-bit: identify, CID/CSD/EXT_CSD, arbitrary read,
   arbitrary write, cross-session persistence.
+
+## 36. Large reads — streaming, re-arm, and the host drain limit
+
+Reversed from a **native 1 GB read** at 40 MHz / 1-bit (`чтение_1гб…pcapng`),
+hardware-verified against a Rust port.
+
+**Big read = one `RD_SETUP` with a huge `n_chunks`, streamed.** The 1 GB read used
+**5 `RD_SETUP`s** with `n_chunks` (byte[16..20]) = `256, 256, 65536, 256, 256`; the
+`65536` one carries the whole 1 GB. Its payload is just `read 16384 (16-byte
+header + 16368 data) + read 16 (tail)` **repeated, with no re-arm** for ~10 000+
+chunks straight. So a large read does **not** need periodic re-arming — it streams.
+
+**Re-arm exists but only for the small `256`-chunk `RD_SETUP`s** (a different
+op — possibly a verify/scan pass). There the cycle is, every `32768`-read (2
+chunks): `read 32768 + read 16, then RD_14 → ep2_send(512 zeros) → RD_15`, where
+the loop `RD_15` has **byte[8] = 0x40** (the initial-arm `RD_15` is byte[8]=0x01).
+Injecting this re-arm into a *streaming* read breaks it (the device, mid-stream,
+doesn't expect the OUT) — so don't.
+
+**The real ceiling for a port is host USB drain speed.** The eMMC clocks data out
+at the bus rate (~5 MB/s at 40 MHz 1-bit). Native (WinUSB) drains fast enough to
+keep a single 65536-chunk `RD_SETUP` flowing for 1 GB. A **libusb** port (Linux,
+or rusb on Windows) drains a touch slower (~4.5 MB/s, two bulk-IN per chunk), so on
+a long `RD_SETUP` the programmer's internal read FIFO **overflows and wedges**
+(`ep1_send`/`ep2_send` error → physical replug). Measured limit on this setup:
+**256 chunks (4 MB) per `RD_SETUP` is safe; 512 is flaky; 1024 wedges.** So a
+libusb port should cap each `read_sectors`/`RD_SETUP` at ~256 chunks and **loop
+many short `RD_SETUP`s inside one reused session** for large volumes — verified
+reliable over 256 MB at 4.55 MB/s (≈ native). (Native avoids the cap purely by
+draining faster, not by any extra command.)
