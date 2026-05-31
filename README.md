@@ -4,9 +4,9 @@
 
 # xgecu-t48-reverse
 
-Reverse-engineered USB protocol notes and a Python prototype for talking
-to the **XGecu T48 (TL866-3G)** universal programmer, with a focus on
-**eMMC** read/write operations (including in-circuit / ISP).
+Reverse-engineered USB protocol notes and a working Python tool for
+talking to the **XGecu T48 (TL866-3G)** universal programmer, with a
+focus on **eMMC** read/write operations (including in-circuit / ISP).
 
 The XGecu T48 is a popular universal chip programmer; its first-party
 software (`Xgpro`) is Windows-only and the device's USB protocol is
@@ -14,15 +14,20 @@ undocumented. The open-source [`minipro`](https://gitlab.com/DavidGriffith/minip
 project covers the classic-chip part of the protocol but explicitly does
 **not** implement eMMC. This repository documents the eMMC extension of
 the protocol — what the wire-format actually looks like — and ships a
-small Python prototype that uses the same encoding.
+working Python tool that uses the same encoding to read and write an
+eMMC in-circuit from Linux.
 
-> **Status: pre-hardware.** The protocol was extracted from static
-> analysis of `Xgpro.exe` (PE32, WinUSB). All three command encodings
-> that were directly decoded from the binary (CMD6 SWITCH→RPMB,
-> SWITCH→USER, SWITCH→HS-200) reproduce byte-for-byte. Things that
-> require a real device (init handshake details, response framing,
-> response timing) are noted as TBD and will be validated against a USB
-> capture once the programmer arrives.
+> **Status: working on real hardware.** The protocol was first extracted
+> from static analysis of `Xgpro.exe` (PE32, WinUSB), then validated
+> against live USB captures from an actual T48 + the XGecu eMMC-ISP
+> adapter on a real eMMC. Arbitrary in-circuit **read and write are
+> hardware-verified** (1-bit, 3.3 V): `examples/t48_emmc_isp.py` reads
+> and writes arbitrary regions, switches partitions (USER / BOOT1 /
+> BOOT2 / RPMB), parses the partition table, and round-trips boot
+> sectors. VCCQ **1.8 V** is implemented from a static reverse of
+> `Xgpro.exe` (`BEGIN[0x15]`) but is **not yet hardware-verified** —
+> only use it on a chip you know is 1.8 V. A handful of rarely-used
+> classic opcodes remain TBD (noted inline in `PROTOCOL.md`).
 
 ## What's in here
 
@@ -36,9 +41,19 @@ small Python prototype that uses the same encoding.
   `ICSP_VCC Enable`, CLK, `Vcc current Imax`, partitions, RST_n wiring):
   what each does and what to enable / disable, cross-checked against the
   wire captures. Russian: [`ISP_SETTINGS.ru.md`](docs/ISP_SETTINGS.ru.md).
-- [`examples/t48_emmc.py`](examples/t48_emmc.py) — a small pyusb
-  prototype: connect to the T48 by VID:PID, build the documented
-  packets, and call them through high-level methods
+- [`examples/t48_emmc_isp.py`](examples/t48_emmc_isp.py) — **the working
+  in-circuit eMMC tool.** Reads and writes arbitrary regions over the
+  XGecu eMMC-ISP adapter by replaying the captured protocol parameterised
+  by block address. Hardware-verified at 1-bit / 3.3 V. Supports
+  partition selection (`USER` / `BOOT1` / `BOOT2` / `RPMB`), erase,
+  partition-table / filesystem-magic parsing, a boot-sector round-trip
+  self-test, and VCCQ `--voltage {3.3,1.8}`. Modes: read-only validation
+  (default, non-destructive), `--write-test`, `--partitions`,
+  `--boot-roundtrip`. Includes anti-wedge teardown/recovery so a timeout
+  no longer requires a physical replug.
+- [`examples/t48_emmc.py`](examples/t48_emmc.py) — the lower-level
+  transport the ISP tool builds on: connect to the T48 by VID:PID, build
+  the documented packets, and call them through high-level methods
   (`switch_partition`, `read_ecsd`, `bulk_read`, RPMB frame builder,
   etc.). Has an offline sanity test that verifies the three decoded
   CMD6 SWITCH arguments match the bytes seen in `Xgpro.exe`. Every USB
@@ -81,9 +96,9 @@ SWITCH HS_TIMING        → HS-200   →  arg = 0x01AF0100
 restore PARTITION_ACCESS → USER    →  arg = 0x02B30700  (CLEAR_BITS of 0x07)
 ```
 
-See `docs/PROTOCOL.md` §9 for the full table.
+See `docs/PROTOCOL.md` §7 for the full table.
 
-## Try the prototype offline
+## Offline sanity test
 
 ```bash
 pip install pyusb
@@ -112,6 +127,26 @@ applies no voltage, needs no chip, and saves a full transfer trace:
 ```bash
 python3 examples/first_contact.py          # → t48_first_contact.log
 ```
+
+## Read/write an eMMC in-circuit
+
+With the XGecu eMMC-ISP adapter wired to a target eMMC, the ISP tool
+reads and writes arbitrary regions. The default mode is non-destructive
+(handshake + init, print CID, read one 16 KB chunk and hexdump it):
+
+```bash
+python3 examples/t48_emmc_isp.py                  # read-only @ block 0x8000
+python3 examples/t48_emmc_isp.py --block 0x100000 # read-only @ another block
+python3 examples/t48_emmc_isp.py --partitions     # parse the partition table
+python3 examples/t48_emmc_isp.py --boot-roundtrip # read boot sectors, write them back, verify
+python3 examples/t48_emmc_isp.py --write-test 0x8000   # write marker + read-back verify (DESTRUCTIVE)
+python3 examples/t48_emmc_isp.py --voltage 1.8    # 1.8 V VCCQ (UNVERIFIED — use only on a known 1.8 V chip)
+```
+
+See [`docs/ISP_SETTINGS.md`](docs/ISP_SETTINGS.md) for what the Xgpro
+settings (bus width, VCCQ, CLK, partitions, RST_n wiring) mean and a
+stable starting point, and `docs/PROTOCOL.md` §33–§35 for the wire-level
+breakdown of the ISP read/write flow.
 
 ## Unpacking a `.alg` (optional)
 
