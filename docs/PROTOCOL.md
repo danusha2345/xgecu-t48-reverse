@@ -2094,10 +2094,12 @@ pair for any normal eMMC read regardless of how the chip is wired.
 
 > **Note (clock):** despite the `0x03` descriptor saying "…clock…", the bus
 > **CLK is NOT encoded in this 64-byte `BEGIN` packet** — `BEGIN` is byte-
-> identical at 8 MHz and 40 MHz. The clock index lives in the init commands
-> (`INIT/READ_ID/READ_CSD` byte[1]) and `OP_3E` byte[5]. See **ISP_SETTINGS §5.1**
-> for the hardware-verified encoding (`0x05`/`0x09` = 40 MHz ≈ 4.5 MB/s 1-bit;
-> `0x00`/`0x08` = slow probe ≈ 0.94 MB/s).
+> identical at 8 MHz and 40 MHz. The clock is the **init `byte[1]`** index (in
+> `0x21`/`0x05`/`0x06`). ✅ **Settled 2026-06-06 by a throughput sweep on hardware:**
+> `byte[1]` `0x05`=40 / `0x04`=30 / `0x03`=20 / `0x00`=8 MHz (monotonic, measured
+> over 64 MB). An intermediate guess that the clock lived in the `OP_3E` blob was
+> **wrong** — with `byte[1]=0x00` any `OP_3E` reads at ~8 MHz. `OP_3E` can stay
+> constant. See **ISP_SETTINGS §5.2** (and §5.3 for the per-chip read re-arm quirk).
 
 Before hardware arrival the `BEGIN_TRANSACTION` builder was generated
 from the inferred §20.2 table. A fresh **radare2 trace of the actual

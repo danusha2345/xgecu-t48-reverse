@@ -113,6 +113,57 @@ used).
 > not from Xgpro. Worth re-testing whether `0x09` actually changes the clock or is
 > a no-op next to the byte[1] index.
 
+### 5.2 Resolved — the clock IS init byte[1], measured by throughput (2026-06-06, hardware)
+
+§5.1 (clock in `byte[1]`) is **correct**; an intermediate guess that the clock
+lived in the `OP_3E` blob was **wrong** and is retracted here. What misled us: a
+capture (`xgecu 30/40/20`) showed Xgpro using `byte[1]=0x00` with *different*
+`OP_3E` blobs at different speeds — so it looked like `OP_3E` carried the clock.
+But a direct **throughput sweep on hardware settled it**: with `byte[1]=0x00` the
+read is ~8 MB/s-equivalent (0.93 MB/s) regardless of the `OP_3E` blob, while
+sweeping `byte[1]` gives a clean monotonic ladder. The `OP_3E` differences Xgpro
+showed are a side-effect, not the clock knob.
+
+**Measured ladder** (64 MB, 1-bit, 1.8 V, eMMC `AJTD4R`, our reader, `OP_3E` held
+at `3e 01 10 00 00 08 00 00`):
+
+| init `byte[1]` | clock | read |
+|---|---|---|
+| `0x05` | 40 MHz | 4.31 MB/s |
+| `0x04` | 30 MHz | 3.30 MB/s |
+| `0x03` | 20 MHz | 2.25 MB/s |
+| `0x02` | ~16 MHz | 1.71 MB/s |
+| `0x01` | ~12 MHz | 1.38 MB/s |
+| `0x00` | 8 MHz (probe) | 0.93 MB/s |
+
+`0x06` (50 MHz) wedges the programmer over ISP. So to port a clock, set init
+`byte[1]` (in `0x21`/`0x05`/`0x06`); `OP_3E` can stay constant. The earlier
+"lowered clock read garbage" symptom was **not** a clock problem at all — it was a
+per-chip read quirk (see §5.3).
+
+### 5.3 Per-chip read quirk: the "re-arm" sequence (some controllers, e.g. `8GTF4R`)
+
+Some eMMC controllers **return zeros for USER** on a plain `RD_SETUP` (`0x0d 01`)
+even though CID/CSD/EXT_CSD read fine — observed on a DJI module with chip PNM
+**`8GTF4R`** (7.28 GiB). Xgpro reads such chips only after a **re-arm** sequence
+before the `RD_SETUP`: ~17 iterations of
+
+```
+RD_14 (0x14 …)  ->  ep2_send(512 zeros)  ->  RD_15 with byte[8]=0x40  ->  drain 32768 (service block, all zeros)  ->  drain 16 (status)
+```
+
+After this warm-up, the ordinary 16 KB-chunk stream over EP2 returns real data —
+**byte-for-byte identical to Xgpro's USB read** (verified against a full
+`UserData.BIN` dump). Normal chips (e.g. `AJTD4R`) don't need it. A reader can
+auto-detect: try a normal read; if neither MBR nor GPT is found, enable the re-arm
+and retry once. Overhead is ~1 % (warm-up cost is on session-open, not throughput).
+
+**GPT without a protective MBR.** The `8GTF4R` card has a valid GPT (LBA1 =
+`EFI PART`) but a **zero LBA0** — no protective MBR, no `55aa`. Xgpro *synthesises*
+a protective MBR into the dump file, but it is **not on the card**. A partition
+parser must accept GPT keyed on LBA1's `EFI PART` even when the MBR signature is
+absent, or such cards read as "0 partitions".
+
 ## 6. `Vcc current Imax`
 
 - Over-current limit (short protection). **`Default`** for normal use;
